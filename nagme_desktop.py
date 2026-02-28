@@ -2140,8 +2140,6 @@ class NagDesktopApp:
         project_name = effective_project_name(entry.nag)
         if not project_name:
             return False
-        if not messagebox.askyesno("Enter project", f"Open project \"{project_name}\"?", parent=self.root):
-            return False
         self.active_project_name = project_name
         self.refresh_visible_entries()
         return True
