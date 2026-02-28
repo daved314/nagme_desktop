@@ -1542,10 +1542,8 @@ class NagDesktopApp:
         self._long_press_job = self.root.after(550, lambda: self._trigger_long_press(event.x, event.y))
 
     def on_canvas_drag(self, event: tk.Event) -> None:
-        if (
-            abs(event.y - self._touch_scroll_press_y) >= self._touch_scroll_threshold_px
-            or abs(event.x - self._touch_scroll_press_x) >= self._touch_scroll_threshold_px
-        ):
+        # Touch scrolling should start only from vertical movement.
+        if abs(event.y - self._touch_scroll_press_y) >= self._touch_scroll_threshold_px:
             self._touch_scroll_dragging = True
         if self._touch_scroll_dragging:
             self._cancel_long_press()
@@ -2035,7 +2033,9 @@ class NagDesktopApp:
         except Exception:
             return None
 
-    def _redraw_canvas(self) -> None:
+    def _redraw_canvas(self, preserve_scroll: bool = True) -> None:
+        previous_view = self.canvas.yview() if preserve_scroll else (0.0, 1.0)
+        previous_start = previous_view[0] if previous_view else 0.0
         self.canvas.delete("all")
         width = max(900, self.canvas.winfo_width())
         row_height = 64
@@ -2056,6 +2056,8 @@ class NagDesktopApp:
                 font=("TkDefaultFont", 11),
             )
             self.canvas.configure(scrollregion=(0, 0, width, 120))
+            if preserve_scroll:
+                self.canvas.yview_moveto(max(0.0, min(1.0, previous_start)))
             return
 
         for index, entry in enumerate(self.visible_entries):
@@ -2144,6 +2146,8 @@ class NagDesktopApp:
 
         total_height = 12 + len(self.visible_entries) * row_height
         self.canvas.configure(scrollregion=(0, 0, width, total_height))
+        if preserve_scroll:
+            self.canvas.yview_moveto(max(0.0, min(1.0, previous_start)))
 
     def _resolve_row_image(self, nag: Nag) -> Optional[ImageTk.PhotoImage]:
         url = normalize_image_url(nag.image_url)
