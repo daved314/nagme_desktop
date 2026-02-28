@@ -12,7 +12,9 @@ Features:
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
+import hashlib
 import json
 import os
 import platform
@@ -32,6 +34,8 @@ TABLE_CANDIDATES = ("nag", "events")
 VIEW_ONLY_MODE = True
 AUTO_RELOAD_INTERVAL_MS = 60 * 60 * 1000
 CREDENTIALS_FILE = os.path.join(os.path.expanduser("~"), ".nagme_desktop_credentials.json")
+CORE_EVENT_SELECT_COLUMNS = "id,created_at,payload,user_id"
+EXTENDED_EVENT_SELECT_COLUMNS = "id,created_at,payload,user_id,icon_png_base64,payload_version,client_synced_at,event_id"
 
 ALL_BUCKET = "All"
 DEFAULT_BUCKETS = ["Work", "Personal", "Weekend", "Holiday"]
@@ -186,6 +190,39 @@ def normalize_image_url(raw_value: Any) -> Optional[str]:
     return None
 
 
+def normalize_icon_png_base64(raw_value: Any) -> Optional[str]:
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, dict):
+        for key in ("icon_png_base64", "iconPngBase64", "base64", "data", "value"):
+            if key in raw_value:
+                value = normalize_icon_png_base64(raw_value.get(key))
+                if value:
+                    return value
+        return None
+    if isinstance(raw_value, (list, tuple)):
+        for item in raw_value:
+            value = normalize_icon_png_base64(item)
+            if value:
+                return value
+        return None
+
+    text = str(raw_value).strip()
+    if not text:
+        return None
+    lower = text.lower()
+    if lower.startswith("data:") and "base64," in lower:
+        text = text.split(",", 1)[1].strip()
+    text = "".join(text.split())
+    if len(text) < 16:
+        return None
+    try:
+        base64.b64decode(text, validate=True)
+    except Exception:
+        return None
+    return text
+
+
 def format_local_datetime(ms: int) -> str:
     return ms_to_local(ms).strftime("%Y-%m-%d %H:%M")
 
@@ -302,6 +339,7 @@ class Nag:
     created_at_epoch_ms: int
     skipped_monthly_due_epoch_ms: List[int] = field(default_factory=list)
     icon_glyph: Optional[str] = None
+    icon_png_base64: Optional[str] = None
     image_url: Optional[str] = None
     recurring_pattern_type: str = PATTERN_DAY_OF_MONTH
     recurring_day_of_week: Optional[int] = None
@@ -350,6 +388,11 @@ class Nag:
                 image_url = normalize_image_url(payload.get(candidate_key))
                 if image_url:
                     break
+            icon_png_base64 = None
+            for candidate_key in ("iconPngBase64", "icon_png_base64", "iconImageBase64", "nagIconBase64"):
+                icon_png_base64 = normalize_icon_png_base64(payload.get(candidate_key))
+                if icon_png_base64:
+                    break
 
             return Nag(
                 work_name=work_name,
@@ -368,6 +411,7 @@ class Nag:
                 created_at_epoch_ms=int(payload.get("createdAtEpochMillis", now_ms())),
                 skipped_monthly_due_epoch_ms=sorted(set(skipped)),
                 icon_glyph=icon_glyph,
+                icon_png_base64=icon_png_base64,
                 image_url=image_url,
                 recurring_pattern_type=str(payload.get("recurringPatternType", PATTERN_DAY_OF_MONTH)),
                 recurring_day_of_week=opt_int("recurringDayOfWeek"),
@@ -401,6 +445,7 @@ class Nag:
             "createdAtEpochMillis": self.created_at_epoch_ms,
             "skippedMonthlyDueEpochMillis": self.skipped_monthly_due_epoch_ms,
             "iconGlyph": self.icon_glyph,
+            "iconPngBase64": self.icon_png_base64,
             "imageUrl": self.image_url,
             "recurringPatternType": self.recurring_pattern_type,
             "recurringDayOfWeek": self.recurring_day_of_week,
@@ -866,6 +911,16 @@ class SupabaseSession:
             return f"HTTP {response.status_code}: {text[:300]}"
         return f"HTTP {response.status_code}: request failed"
 
+    @staticmethod
+    def _is_missing_optional_column_error(response: requests.Response) -> bool:
+        text = (response.text or "").lower()
+        references_optional = any(
+            col in text for col in ("icon_png_base64", "payload_version", "client_synced_at", "event_id")
+        )
+        if not references_optional:
+            return False
+        return ("column" in text and "does not exist" in text) or ("schema cache" in text)
+
     def detect_table(self) -> str:
         if self.table_name:
             return self.table_name
@@ -914,7 +969,7 @@ class SupabaseSession:
             try:
                 while True:
                     params = {
-                        "select": "id,created_at,payload,user_id",
+                        "select": EXTENDED_EVENT_SELECT_COLUMNS,
                         "order": "created_at.asc",
                         "limit": str(step),
                         "offset": str(offset),
@@ -925,6 +980,14 @@ class SupabaseSession:
                         params=params,
                         timeout=30,
                     )
+                    if response.status_code >= 300 and self._is_missing_optional_column_error(response):
+                        params["select"] = CORE_EVENT_SELECT_COLUMNS
+                        response = requests.get(
+                            f"{self.supabase_url}/rest/v1/{table}",
+                            headers=headers,
+                            params=params,
+                            timeout=30,
+                        )
                     if response.status_code >= 300:
                         raise RuntimeError(self._extract_error(response))
                     batch = response.json()
@@ -972,7 +1035,21 @@ class SupabaseSession:
                 str(event.get("user_id", "")),
                 payload_key,
             )
-            dedup[dedup_key] = event
+            existing = dedup.get(dedup_key)
+            if existing is None:
+                dedup[dedup_key] = event
+                continue
+
+            incoming_has_icon = normalize_icon_png_base64(event.get("icon_png_base64")) is not None
+            existing_has_icon = normalize_icon_png_base64(existing.get("icon_png_base64")) is not None
+            if incoming_has_icon and not existing_has_icon:
+                dedup[dedup_key] = event
+                continue
+            if incoming_has_icon == existing_has_icon:
+                incoming_source = str(event.get("_source_table", ""))
+                existing_source = str(existing.get("_source_table", ""))
+                if incoming_source == self.table_name and existing_source != self.table_name:
+                    dedup[dedup_key] = event
 
         rows = list(dedup.values())
         rows.sort(key=lambda row: str(row.get("created_at", "")))
@@ -1767,6 +1844,9 @@ class NagDesktopApp:
             nag = Nag.from_payload(payload)
             if not nag:
                 continue
+            row_icon_base64 = normalize_icon_png_base64(row.get("icon_png_base64"))
+            if row_icon_base64:
+                nag.icon_png_base64 = row_icon_base64
             valid_nag_count += 1
             action = str(payload.get("action", "")).strip().lower()
             if action == "delete":
@@ -2181,6 +2261,23 @@ class NagDesktopApp:
             self.canvas.yview_moveto(max(0.0, min(1.0, previous_start)))
 
     def _resolve_row_image(self, nag: Nag) -> Optional[ImageTk.PhotoImage]:
+        inline_icon_base64 = normalize_icon_png_base64(nag.icon_png_base64)
+        if inline_icon_base64:
+            inline_key = f"inline:{hashlib.sha1(inline_icon_base64.encode('utf-8')).hexdigest()}"
+            if inline_key not in self.row_image_failures:
+                cached_inline = self.row_image_cache.get(inline_key)
+                if cached_inline is not None:
+                    return cached_inline
+                try:
+                    image = Image.open(BytesIO(base64.b64decode(inline_icon_base64, validate=True)))
+                    image = image.convert("RGBA")
+                    image.thumbnail((36, 36), Image.Resampling.LANCZOS)
+                    photo = ImageTk.PhotoImage(image)
+                    self.row_image_cache[inline_key] = photo
+                    return photo
+                except Exception:
+                    self.row_image_failures.add(inline_key)
+
         url = normalize_image_url(nag.image_url)
         if not url or url in self.row_image_failures:
             return None
