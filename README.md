@@ -12,6 +12,8 @@ Desktop companion app for the Nagme Supabase data store.
 - Reconstructs current nag state from event rows.
 - Shows nag bars with due/progress coloring and time/percent indicators.
 - Supports bucket filtering, sort modes, recurring window modes.
+- Supports Supabase password-reset request from the login panel.
+- Renders nag row images when payload includes an image URL (for example `imageUrl`).
 - Shows add/edit/delete controls but runs in view-only mode right now (write actions are disabled).
 
 ## Setup

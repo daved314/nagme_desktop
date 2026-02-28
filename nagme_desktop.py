@@ -14,19 +14,24 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import platform
 import tkinter as tk
 import uuid
+from io import BytesIO
 from dataclasses import dataclass, field
 from tkinter import messagebox, simpledialog, ttk
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from PIL import Image, ImageTk
 
 SUPABASE_URL = "https://gaehvakpfvcuzurbqkvv.supabase.co"
 SUPABASE_PUBLISHABLE_KEY = "sb_publishable_lwqNwhtsIC73MVWFqL35XA_w72wCi1X"
 TABLE_CANDIDATES = ("nag", "events")
 VIEW_ONLY_MODE = True
+AUTO_RELOAD_INTERVAL_MS = 60 * 60 * 1000
+CREDENTIALS_FILE = os.path.join(os.path.expanduser("~"), ".nagme_desktop_credentials.json")
 
 ALL_BUCKET = "All"
 DEFAULT_BUCKETS = ["Work", "Personal", "Weekend", "Holiday"]
@@ -75,6 +80,22 @@ COLOR_THEME = {
     "far_future_progress": "#D5D5D5",
 }
 
+INVALID_ICON_TOKENS = {"", "none", "null", "non", "img", "undefined", "nan", "na", "n/a"}
+SORT_ICON_MAP = {
+    SORT_ENTERED: "🕒",
+    SORT_WEIGHT: "⚖️",
+    SORT_DUE: "⏰",
+    SORT_SMART: "🧠",
+}
+VIEW_WINDOW_ICON_MAP = {
+    "30 days": "📅",
+    "1 year": "🗓️",
+}
+RECURRING_ICON_MAP = {
+    RECUR_NEXT_ONLY: "➡️",
+    RECUR_ALL_WINDOW: "🔁",
+}
+
 
 def now_ms() -> int:
     return int(dt.datetime.now(tz=dt.timezone.utc).timestamp() * 1000)
@@ -105,6 +126,63 @@ def parse_local_datetime(text: str) -> Optional[dt.datetime]:
             return parsed.replace(tzinfo=local_tz())
         except ValueError:
             continue
+    return None
+
+
+def looks_like_icon_text(text: str) -> bool:
+    # Favor emoji/symbol glyphs; suppress verbose placeholders.
+    return any(ord(ch) > 127 for ch in text)
+
+
+def normalize_icon_glyph(raw_value: Any) -> Optional[str]:
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, dict):
+        for key in ("glyph", "emoji", "icon", "text", "value", "label", "name"):
+            if key in raw_value:
+                value = normalize_icon_glyph(raw_value.get(key))
+                if value:
+                    return value
+        return None
+    if isinstance(raw_value, (list, tuple)):
+        for item in raw_value:
+            value = normalize_icon_glyph(item)
+            if value:
+                return value
+        return None
+
+    text = str(raw_value).strip()
+    if not text:
+        return None
+    if text.lower() in INVALID_ICON_TOKENS:
+        return None
+    if text.lower().startswith("<img") or text.lower().startswith("http"):
+        return None
+    if text.lower().startswith("icon:"):
+        text = text.split(":", 1)[1].strip()
+        if not text:
+            return None
+    if not looks_like_icon_text(text):
+        return None
+    return text
+
+
+def normalize_image_url(raw_value: Any) -> Optional[str]:
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, dict):
+        for key in ("url", "src", "imageUrl", "image", "iconUrl", "icon"):
+            if key in raw_value:
+                value = normalize_image_url(raw_value.get(key))
+                if value:
+                    return value
+        return None
+    text = str(raw_value).strip()
+    if not text:
+        return None
+    lower = text.lower()
+    if lower.startswith("http://") or lower.startswith("https://"):
+        return text
     return None
 
 
@@ -224,6 +302,7 @@ class Nag:
     created_at_epoch_ms: int
     skipped_monthly_due_epoch_ms: List[int] = field(default_factory=list)
     icon_glyph: Optional[str] = None
+    image_url: Optional[str] = None
     recurring_pattern_type: str = PATTERN_DAY_OF_MONTH
     recurring_day_of_week: Optional[int] = None
     recurring_nth_week: Optional[int] = None
@@ -261,6 +340,17 @@ class Nag:
             continue_minutes_raw = payload.get("continueMinutes")
             continue_minutes = None if continue_minutes_raw is None else int(continue_minutes_raw)
 
+            icon_glyph = None
+            for candidate_key in ("iconGlyph", "icon", "iconEmoji", "nagIcon", "iconText"):
+                icon_glyph = normalize_icon_glyph(payload.get(candidate_key))
+                if icon_glyph:
+                    break
+            image_url = None
+            for candidate_key in ("imageUrl", "iconImageUrl", "nagImageUrl", "nagImage", "iconUrl", "image", "icon"):
+                image_url = normalize_image_url(payload.get(candidate_key))
+                if image_url:
+                    break
+
             return Nag(
                 work_name=work_name,
                 nag_text=nag_text,
@@ -277,7 +367,8 @@ class Nag:
                 monthly_minute=opt_int("monthlyMinute"),
                 created_at_epoch_ms=int(payload.get("createdAtEpochMillis", now_ms())),
                 skipped_monthly_due_epoch_ms=sorted(set(skipped)),
-                icon_glyph=(str(payload.get("iconGlyph", "")).strip() or None),
+                icon_glyph=icon_glyph,
+                image_url=image_url,
                 recurring_pattern_type=str(payload.get("recurringPatternType", PATTERN_DAY_OF_MONTH)),
                 recurring_day_of_week=opt_int("recurringDayOfWeek"),
                 recurring_nth_week=opt_int("recurringNthWeek"),
@@ -310,6 +401,7 @@ class Nag:
             "createdAtEpochMillis": self.created_at_epoch_ms,
             "skippedMonthlyDueEpochMillis": self.skipped_monthly_due_epoch_ms,
             "iconGlyph": self.icon_glyph,
+            "imageUrl": self.image_url,
             "recurringPatternType": self.recurring_pattern_type,
             "recurringDayOfWeek": self.recurring_day_of_week,
             "recurringNthWeek": self.recurring_nth_week,
@@ -733,6 +825,17 @@ class SupabaseSession:
         self.detect_table()
         return self.user_id
 
+    def change_password(self, new_password: str) -> None:
+        endpoint = f"{self.supabase_url}/auth/v1/user"
+        response = requests.put(
+            endpoint,
+            headers=self._auth_headers(include_json=True),
+            json={"password": new_password},
+            timeout=25,
+        )
+        if response.status_code >= 300:
+            raise RuntimeError(self._extract_error(response))
+
     def _auth_headers(self, include_json: bool = True) -> Dict[str, str]:
         if not self.access_token:
             raise RuntimeError("Not signed in.")
@@ -1149,6 +1252,16 @@ class NagDesktopApp:
         self.row_bounds: List[Tuple[int, int, NagListEntry]] = []
         self.selected_key: Optional[str] = None
         self.write_buttons: List[ttk.Button] = []
+        self.auto_reload_job: Optional[str] = None
+        self.bucket_options: List[str] = [ALL_BUCKET] + DEFAULT_BUCKETS[:]
+        self.bucket_buttons: Dict[str, tk.Button] = {}
+        self.sort_buttons: Dict[str, tk.Button] = {}
+        self.window_buttons: Dict[str, tk.Button] = {}
+        self.recurring_buttons: Dict[str, tk.Button] = {}
+        self.row_image_cache: Dict[str, ImageTk.PhotoImage] = {}
+        self.row_image_failures: set[str] = set()
+        self._touch_scroll_press_y = 0
+        self._touch_scroll_dragging = False
         self.last_parseable_payload_rows = 0
         self.last_valid_nag_rows = 0
 
@@ -1167,8 +1280,11 @@ class NagDesktopApp:
         self.recurring_mode_var = tk.StringVar(value=RECUR_NEXT_ONLY)
 
         self._build_ui()
+        self._load_saved_credentials()
         self._update_auth_indicator()
         self._redraw_canvas()
+        self._schedule_auto_reload()
+        self.root.after(400, self.auto_sign_in_if_possible)
 
     def _configure_platform_ui(self) -> None:
         system = platform.system().lower()
@@ -1200,10 +1316,11 @@ class NagDesktopApp:
         self.sign_in_button.grid(row=0, column=4, padx=6, pady=4)
         self.sign_out_button = ttk.Button(login, text="Sign out", command=self.sign_out)
         self.sign_out_button.grid(row=0, column=5, padx=6, pady=4)
+        self.change_password_button = ttk.Button(login, text="Change password", command=self.change_password)
+        self.change_password_button.grid(row=0, column=6, padx=6, pady=4)
         self.reload_button = ttk.Button(login, text="Reload", command=self.reload_from_supabase)
-        self.reload_button.grid(row=0, column=6, padx=6, pady=4)
-        self.sync_all_button = ttk.Button(login, text="Sync all", command=self.sync_all)
-        self.sync_all_button.grid(row=0, column=7, padx=6, pady=4)
+        self.reload_button.grid(row=0, column=7, padx=6, pady=4)
+        self.reload_button.configure(text="Reload now")
 
         login_bg = self.root.cget("bg")
         self.auth_indicator_canvas = tk.Canvas(
@@ -1224,43 +1341,45 @@ class NagDesktopApp:
         controls.pack(fill=tk.X, pady=(0, 8))
 
         ttk.Label(controls, text="Bucket").grid(row=0, column=0, padx=6, pady=4, sticky="w")
-        self.bucket_combo = ttk.Combobox(controls, textvariable=self.bucket_var, state="readonly", width=18)
-        self.bucket_combo.grid(row=0, column=1, padx=6, pady=4, sticky="w")
-        self.bucket_combo.bind("<<ComboboxSelected>>", lambda _: self.refresh_visible_entries())
+        self.bucket_selector_frame = ttk.Frame(controls)
+        self.bucket_selector_frame.grid(row=0, column=1, padx=4, pady=2, sticky="w")
 
         ttk.Label(controls, text="Sort").grid(row=0, column=2, padx=6, pady=4, sticky="w")
-        sort_combo = ttk.Combobox(controls, textvariable=self.sort_var, values=SORT_OPTIONS, state="readonly", width=12)
-        sort_combo.grid(row=0, column=3, padx=6, pady=4, sticky="w")
-        sort_combo.bind("<<ComboboxSelected>>", lambda _: self.refresh_visible_entries())
+        sort_selector_frame = ttk.Frame(controls)
+        sort_selector_frame.grid(row=0, column=3, padx=4, pady=2, sticky="w")
+        self._render_icon_button_group(
+            container=sort_selector_frame,
+            options=SORT_OPTIONS,
+            selected_value=self.sort_var,
+            icon_for=lambda value: SORT_ICON_MAP.get(value, "•"),
+            button_store=self.sort_buttons,
+            on_select=self.refresh_visible_entries,
+        )
 
         ttk.Label(controls, text="Monthly window").grid(row=0, column=4, padx=6, pady=4, sticky="w")
-        view_combo = ttk.Combobox(controls, textvariable=self.view_days_var, values=["30 days", "1 year"], state="readonly", width=10)
-        view_combo.grid(row=0, column=5, padx=6, pady=4, sticky="w")
-        view_combo.bind("<<ComboboxSelected>>", lambda _: self.refresh_visible_entries())
+        window_selector_frame = ttk.Frame(controls)
+        window_selector_frame.grid(row=0, column=5, padx=4, pady=2, sticky="w")
+        self._render_icon_button_group(
+            container=window_selector_frame,
+            options=["30 days", "1 year"],
+            selected_value=self.view_days_var,
+            icon_for=lambda value: VIEW_WINDOW_ICON_MAP.get(value, "•"),
+            button_store=self.window_buttons,
+            on_select=self.refresh_visible_entries,
+        )
 
         ttk.Label(controls, text="Recurring").grid(row=0, column=6, padx=6, pady=4, sticky="w")
-        recurring_combo = ttk.Combobox(
-            controls,
-            textvariable=self.recurring_mode_var,
-            values=[RECUR_NEXT_ONLY, RECUR_ALL_WINDOW],
-            state="readonly",
-            width=12,
+        recurring_selector_frame = ttk.Frame(controls)
+        recurring_selector_frame.grid(row=0, column=7, padx=4, pady=2, sticky="w")
+        self._render_icon_button_group(
+            container=recurring_selector_frame,
+            options=[RECUR_NEXT_ONLY, RECUR_ALL_WINDOW],
+            selected_value=self.recurring_mode_var,
+            icon_for=lambda value: RECURRING_ICON_MAP.get(value, "•"),
+            button_store=self.recurring_buttons,
+            on_select=self.refresh_visible_entries,
         )
-        recurring_combo.grid(row=0, column=7, padx=6, pady=4, sticky="w")
-        recurring_combo.bind("<<ComboboxSelected>>", lambda _: self.refresh_visible_entries())
-
-        self.add_button = ttk.Button(controls, text="Add nag", command=self.add_nag)
-        self.add_button.grid(row=0, column=8, padx=8, pady=4)
-        self.edit_button = ttk.Button(controls, text="Edit selected", command=self.edit_selected)
-        self.edit_button.grid(row=0, column=9, padx=8, pady=4)
-        self.delete_button = ttk.Button(controls, text="Delete selected", command=self.delete_selected)
-        self.delete_button.grid(row=0, column=10, padx=8, pady=4)
-        self.write_buttons = [
-            self.sync_all_button,
-            self.add_button,
-            self.edit_button,
-            self.delete_button,
-        ]
+        self.write_buttons = []
 
         list_frame = ttk.Frame(main)
         list_frame.pack(fill=tk.BOTH, expand=True)
@@ -1268,12 +1387,10 @@ class NagDesktopApp:
         self.canvas = tk.Canvas(list_frame, bg="#fafafa", highlightthickness=0)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.canvas.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.canvas.configure(yscrollcommand=scrollbar.set)
-
         self.canvas.bind("<Configure>", lambda _: self._redraw_canvas())
-        self.canvas.bind("<Button-1>", self.on_canvas_click)
+        self.canvas.bind("<ButtonPress-1>", self.on_canvas_press)
+        self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
         self.canvas.bind("<Double-1>", self.on_canvas_double_click)
         self.canvas.bind("<Button-3>", self.on_canvas_right_click)
 
@@ -1295,12 +1412,133 @@ class NagDesktopApp:
         self._apply_view_only_ui_state()
         self.update_bucket_options()
 
+    def _render_icon_button_group(
+        self,
+        container: tk.Misc,
+        options: List[str],
+        selected_value: tk.StringVar,
+        icon_for: Any,
+        button_store: Dict[str, tk.Button],
+        on_select: Any,
+    ) -> None:
+        for child in container.winfo_children():
+            child.destroy()
+        button_store.clear()
+        for col, option in enumerate(options):
+            button = tk.Button(
+                container,
+                text=icon_for(option),
+                font=("Segoe UI Emoji", 16),
+                width=3,
+                height=1,
+                padx=2,
+                pady=2,
+                command=lambda value=option: self._set_filter_value(selected_value, value, on_select),
+            )
+            button.grid(row=0, column=col, padx=2, pady=2, sticky="w")
+            button_store[option] = button
+        self._update_icon_button_state(button_store, selected_value.get())
+
+    def _set_filter_value(self, var: tk.StringVar, value: str, on_select: Any) -> None:
+        var.set(value)
+        self._update_icon_button_state(self.bucket_buttons, self.bucket_var.get())
+        self._update_icon_button_state(self.sort_buttons, self.sort_var.get())
+        self._update_icon_button_state(self.window_buttons, self.view_days_var.get())
+        self._update_icon_button_state(self.recurring_buttons, self.recurring_mode_var.get())
+        on_select()
+
+    def _update_icon_button_state(self, button_map: Dict[str, tk.Button], selected_value: str) -> None:
+        for value, button in button_map.items():
+            if value == selected_value:
+                button.configure(relief=tk.SUNKEN, bg="#d8ecff")
+            else:
+                button.configure(relief=tk.RAISED, bg="#f1f1f1")
+
+    @staticmethod
+    def _bucket_icon(bucket_name: str) -> str:
+        text = bucket_name.strip().lower()
+        if text == ALL_BUCKET.lower():
+            return "🧺"
+        if text == "work":
+            return "💼"
+        if text == "personal":
+            return "👤"
+        if text == "weekend":
+            return "🌴"
+        if text == "holiday":
+            return "🎉"
+        return "🏷️"
+
+    def _load_saved_credentials(self) -> None:
+        try:
+            if not os.path.exists(CREDENTIALS_FILE):
+                return
+            with open(CREDENTIALS_FILE, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            email = str(data.get("email", "")).strip()
+            password = str(data.get("password", ""))
+            if email:
+                self.email_var.set(email)
+            if password:
+                self.password_var.set(password)
+        except Exception:
+            # Credentials are optional; ignore local file parse issues.
+            return
+
+    def _save_credentials(self, email: str, password: str) -> None:
+        data = {"email": email.strip(), "password": password}
+        try:
+            with open(CREDENTIALS_FILE, "w", encoding="utf-8") as handle:
+                json.dump(data, handle)
+        except Exception:
+            return
+
+    def _clear_saved_credentials(self) -> None:
+        try:
+            if os.path.exists(CREDENTIALS_FILE):
+                os.remove(CREDENTIALS_FILE)
+        except Exception:
+            return
+
+    def auto_sign_in_if_possible(self) -> None:
+        if self.session.signed_in:
+            return
+        if not self.email_var.get().strip() or not self.password_var.get():
+            return
+        self.sign_in(interactive=False)
+
+    def _schedule_auto_reload(self) -> None:
+        self.auto_reload_job = self.root.after(AUTO_RELOAD_INTERVAL_MS, self._auto_reload_tick)
+
+    def _auto_reload_tick(self) -> None:
+        try:
+            if self.session.signed_in:
+                self.reload_from_supabase(interactive=False, source_label="hourly auto-reload")
+        finally:
+            self._schedule_auto_reload()
+
     def on_mousewheel(self, event: tk.Event) -> None:
         delta = event.delta
         if delta > 0:
             self.canvas.yview_scroll(-1, "units")
         elif delta < 0:
             self.canvas.yview_scroll(1, "units")
+
+    def on_canvas_press(self, event: tk.Event) -> None:
+        self._touch_scroll_press_y = event.y
+        self._touch_scroll_dragging = False
+        self.canvas.scan_mark(event.x, event.y)
+
+    def on_canvas_drag(self, event: tk.Event) -> None:
+        if abs(event.y - self._touch_scroll_press_y) >= 8:
+            self._touch_scroll_dragging = True
+        if self._touch_scroll_dragging:
+            self.canvas.scan_dragto(event.x, event.y, gain=1)
+
+    def on_canvas_release(self, event: tk.Event) -> None:
+        if self._touch_scroll_dragging:
+            return
+        self.on_canvas_click(event)
 
     def _apply_view_only_ui_state(self) -> None:
         if not VIEW_ONLY_MODE:
@@ -1315,7 +1553,7 @@ class NagDesktopApp:
     def _reject_write_when_view_only(self) -> bool:
         if not VIEW_ONLY_MODE:
             return False
-        self.set_status("View-only mode is enabled. Write/sync actions are disabled.")
+        self.set_status("View-only mode is enabled. Write actions are disabled.")
         return True
 
     def _update_auth_indicator(self) -> None:
@@ -1333,26 +1571,69 @@ class NagDesktopApp:
     def set_status(self, message: str) -> None:
         self.status_var.set(message)
 
-    def sign_in(self) -> None:
+    def change_password(self) -> None:
+        if not self.session.signed_in:
+            messagebox.showwarning("Sign in required", "Sign in first.", parent=self.root)
+            return
+        new_password = simpledialog.askstring(
+            "Change password",
+            "Enter new password:",
+            parent=self.root,
+            show="*",
+        )
+        if new_password is None:
+            return
+        new_password = new_password.strip()
+        if len(new_password) < 8:
+            messagebox.showerror("Validation", "Password must be at least 8 characters.", parent=self.root)
+            return
+        confirm_password = simpledialog.askstring(
+            "Change password",
+            "Confirm new password:",
+            parent=self.root,
+            show="*",
+        )
+        if confirm_password is None:
+            return
+        if new_password != confirm_password.strip():
+            messagebox.showerror("Validation", "Passwords do not match.", parent=self.root)
+            return
+        try:
+            self.session.change_password(new_password)
+            email = self.email_var.get().strip()
+            if email:
+                self._save_credentials(email, new_password)
+            self.password_var.set(new_password)
+            self.set_status("Password changed successfully.")
+            messagebox.showinfo("Password updated", "Your password has been changed.", parent=self.root)
+        except Exception as exc:
+            self.set_status(f"Password change failed: {exc}")
+            messagebox.showerror("Password change failed", str(exc), parent=self.root)
+
+    def sign_in(self, interactive: bool = True) -> None:
         email = self.email_var.get().strip()
         password = self.password_var.get()
         if not email or not password:
-            messagebox.showwarning("Missing", "Enter email and password first.", parent=self.root)
+            if interactive:
+                messagebox.showwarning("Missing", "Enter email and password first.", parent=self.root)
             return
         try:
             user_id = self.session.sign_in(email, password)
+            self._save_credentials(email, password)
             self._update_auth_indicator()
             self.user_id_var.set(f"User ID: {user_id}")
             self.set_status(f"Signed in as {user_id}. Loading nags...")
-            self.reload_from_supabase()
+            self.reload_from_supabase(interactive=interactive, source_label="sign-in")
         except Exception as exc:
             self._update_auth_indicator()
             self.user_id_var.set("User ID: (sign-in failed)")
             self.set_status(f"Sign-in failed: {exc}")
-            messagebox.showerror("Supabase sign-in failed", str(exc), parent=self.root)
+            if interactive:
+                messagebox.showerror("Supabase sign-in failed", str(exc), parent=self.root)
 
     def sign_out(self) -> None:
         self.session.sign_out()
+        self._clear_saved_credentials()
         self.events = []
         self.nags_by_work = {}
         self.visible_entries = []
@@ -1406,9 +1687,10 @@ class NagDesktopApp:
         self.last_valid_nag_rows = valid_nag_count
         self.nags_by_work = current
 
-    def reload_from_supabase(self) -> None:
+    def reload_from_supabase(self, interactive: bool = True, source_label: str = "manual reload") -> None:
         if not self.session.signed_in:
-            messagebox.showinfo("Sign in required", "Sign in first.", parent=self.root)
+            if interactive:
+                messagebox.showinfo("Sign in required", "Sign in first.", parent=self.root)
             return
         try:
             self.events = self.session.fetch_events()
@@ -1431,14 +1713,15 @@ class NagDesktopApp:
             if len(self.events) == 0:
                 no_rows_suffix = " No readable rows were returned for this signed-in user."
             self.set_status(
-                f"Loaded {len(self.events)} merged row(s), active nags: {len(self.nags_by_work)} "
+                f"{source_label}: loaded {len(self.events)} merged row(s), active nags: {len(self.nags_by_work)} "
                 f"(payload rows {self.last_parseable_payload_rows}, valid nag rows {self.last_valid_nag_rows}; "
                 f"tables {table_counts}; active table: {self.session.table_name}; "
                 f"user {self.session.user_id}{errors_suffix}).{no_rows_suffix}"
             )
         except Exception as exc:
             self.set_status(f"Load failed: {exc}")
-            messagebox.showerror("Supabase load failed", str(exc), parent=self.root)
+            if interactive:
+                messagebox.showerror("Supabase load failed", str(exc), parent=self.root)
 
     def update_bucket_options(self) -> None:
         buckets = sorted({nag.bucket for nag in self.nags_by_work.values()}, key=lambda s: s.lower())
@@ -1451,9 +1734,17 @@ class NagDesktopApp:
                 final.append(bucket)
         if not final:
             final = [ALL_BUCKET] + DEFAULT_BUCKETS
-        self.bucket_combo.configure(values=final)
+        self.bucket_options = final
         if self.bucket_var.get() not in final:
             self.bucket_var.set(ALL_BUCKET)
+        self._render_icon_button_group(
+            container=self.bucket_selector_frame,
+            options=final,
+            selected_value=self.bucket_var,
+            icon_for=self._bucket_icon,
+            button_store=self.bucket_buttons,
+            on_select=self.refresh_visible_entries,
+        )
 
     def refresh_visible_entries(self) -> None:
         now_value = now_ms()
@@ -1539,7 +1830,7 @@ class NagDesktopApp:
     def add_nag(self) -> None:
         if self._reject_write_when_view_only():
             return
-        buckets = [b for b in self.bucket_combo.cget("values") if b != ALL_BUCKET]
+        buckets = [b for b in self.bucket_options if b != ALL_BUCKET]
         dialog = NagDialog(self.root, None, buckets)
         self.root.wait_window(dialog)
         if not dialog.result:
@@ -1562,7 +1853,7 @@ class NagDesktopApp:
         if not nag:
             return
 
-        buckets = [b for b in self.bucket_combo.cget("values") if b != ALL_BUCKET]
+        buckets = [b for b in self.bucket_options if b != ALL_BUCKET]
         dialog = NagDialog(self.root, nag, buckets)
         self.root.wait_window(dialog)
         if not dialog.result:
@@ -1686,9 +1977,10 @@ class NagDesktopApp:
     def _redraw_canvas(self) -> None:
         self.canvas.delete("all")
         width = max(900, self.canvas.winfo_width())
-        row_height = 58
+        row_height = 64
         x0 = 8
         x1 = width - 12
+        selected_bucket = self.bucket_var.get() or ALL_BUCKET
 
         self.row_bounds = []
         now_value = now_ms()
@@ -1736,9 +2028,17 @@ class NagDesktopApp:
                 self.canvas.create_rectangle(x0, y0, x1, y1, outline="#1565c0", width=2)
 
             left_text_x = x0 + 10
-            icon = (nag.icon_glyph or "")[:3]
+            image = self._resolve_row_image(nag)
+            if image is not None:
+                self.canvas.create_image(x0 + 10, y0 + int((row_height - 8) / 2), image=image, anchor="w")
+                left_text_x = x0 + 54
+            icon = (normalize_icon_glyph(nag.icon_glyph) or "")[:3]
+            if image is not None:
+                icon = ""
             title = f"{icon + ' ' if icon else ''}{nag.nag_text}"
-            subtitle_parts = [f"[{nag.bucket}]", f"w{nag.weight}", f"late:{nag.lateness_days}d"]
+            subtitle_parts: List[str] = [f"w{nag.weight}", f"late:{nag.lateness_days}d"]
+            if selected_bucket == ALL_BUCKET:
+                subtitle_parts.insert(0, f"[{nag.bucket}]")
             recurring_badge = recurring_indicator_label(nag)
             if recurring_badge:
                 subtitle_parts.append(recurring_badge)
@@ -1749,7 +2049,7 @@ class NagDesktopApp:
 
             self.canvas.create_text(
                 left_text_x,
-                y0 + 15,
+                y0 + 18,
                 anchor="w",
                 text=title,
                 fill=visual.text_color,
@@ -1759,7 +2059,7 @@ class NagDesktopApp:
 
             self.canvas.create_text(
                 left_text_x,
-                y0 + 34,
+                y0 + 39,
                 anchor="w",
                 text=subtitle,
                 fill=visual.text_color,
@@ -1783,6 +2083,29 @@ class NagDesktopApp:
 
         total_height = 12 + len(self.visible_entries) * row_height
         self.canvas.configure(scrollregion=(0, 0, width, total_height))
+
+    def _resolve_row_image(self, nag: Nag) -> Optional[ImageTk.PhotoImage]:
+        url = normalize_image_url(nag.image_url)
+        if not url or url in self.row_image_failures:
+            return None
+        cached = self.row_image_cache.get(url)
+        if cached is not None:
+            return cached
+
+        try:
+            response = requests.get(url, timeout=12)
+            if response.status_code >= 300:
+                self.row_image_failures.add(url)
+                return None
+            image = Image.open(BytesIO(response.content))
+            image = image.convert("RGBA")
+            image.thumbnail((36, 36), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(image)
+            self.row_image_cache[url] = photo
+            return photo
+        except Exception:
+            self.row_image_failures.add(url)
+            return None
 
 
 def main() -> None:
