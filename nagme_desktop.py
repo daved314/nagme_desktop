@@ -38,7 +38,9 @@ CORE_EVENT_SELECT_COLUMNS = "id,created_at,payload,user_id"
 EXTENDED_EVENT_SELECT_COLUMNS = "id,created_at,payload,user_id,icon_png_base64,payload_version,client_synced_at,event_id"
 
 ALL_BUCKET = "All"
-DEFAULT_BUCKETS = ["Work", "Personal", "Weekend", "Holiday"]
+PROJECT_BUCKET = "Project"
+DEFAULT_PROJECT_NAME = "General"
+DEFAULT_BUCKETS = ["Work", "Personal", "Weekend", "Holiday", PROJECT_BUCKET]
 
 MONTHLY_VIEW_30_DAYS = 30
 MONTHLY_VIEW_1_YEAR_DAYS = 365
@@ -223,6 +225,13 @@ def normalize_icon_png_base64(raw_value: Any) -> Optional[str]:
     return text
 
 
+def normalize_project_name(raw_value: Any) -> Optional[str]:
+    if raw_value is None:
+        return None
+    text = str(raw_value).replace("\n", " ").replace("\r", " ").strip()
+    return text if text else None
+
+
 def format_local_datetime(ms: int) -> str:
     return ms_to_local(ms).strftime("%Y-%m-%d %H:%M")
 
@@ -326,6 +335,7 @@ class Nag:
     work_name: str
     nag_text: str
     bucket: str
+    project_name: Optional[str]
     lateness_days: int
     mode: str
     repeat_minutes: int
@@ -346,6 +356,7 @@ class Nag:
     recurring_nth_week: Optional[int] = None
     recurring_month_of_year: Optional[int] = None
     recurring_quarter_anchor_month: Optional[int] = None
+    recurring_visible_days_before_due: Optional[int] = None
     pushed_offset_ms: int = 0
     push_count: int = 0
     pushed_total_ms: int = 0
@@ -388,16 +399,30 @@ class Nag:
                 image_url = normalize_image_url(payload.get(candidate_key))
                 if image_url:
                     break
+            project_name = None
+            for candidate_key in ("projectName", "project", "project_name"):
+                project_name = normalize_project_name(payload.get(candidate_key))
+                if project_name:
+                    break
             icon_png_base64 = None
             for candidate_key in ("iconPngBase64", "icon_png_base64", "iconImageBase64", "nagIconBase64"):
                 icon_png_base64 = normalize_icon_png_base64(payload.get(candidate_key))
                 if icon_png_base64:
                     break
+            recurring_visible_days_before_due = opt_int("recurringVisibleDaysBeforeDue")
+            if recurring_visible_days_before_due is not None:
+                recurring_visible_days_before_due = max(1, recurring_visible_days_before_due)
+            bucket = str(payload.get("bucket", DEFAULT_BUCKETS[0])) or DEFAULT_BUCKETS[0]
+            if bucket.lower() == PROJECT_BUCKET.lower():
+                project_name = project_name or DEFAULT_PROJECT_NAME
+            else:
+                project_name = None
 
             return Nag(
                 work_name=work_name,
                 nag_text=nag_text,
-                bucket=str(payload.get("bucket", DEFAULT_BUCKETS[0])) or DEFAULT_BUCKETS[0],
+                bucket=bucket,
+                project_name=project_name,
                 lateness_days=max(1, int(payload.get("latenessDays", 7))),
                 mode=str(payload.get("mode", NAG_MODE_ONE_TIME)) or NAG_MODE_ONE_TIME,
                 repeat_minutes=max(1, int(payload.get("repeatMinutes", 60))),
@@ -418,6 +443,7 @@ class Nag:
                 recurring_nth_week=opt_int("recurringNthWeek"),
                 recurring_month_of_year=opt_int("recurringMonthOfYear"),
                 recurring_quarter_anchor_month=opt_int("recurringQuarterAnchorMonth"),
+                recurring_visible_days_before_due=recurring_visible_days_before_due,
                 pushed_offset_ms=max(0, int(payload.get("pushedOffsetMillis", 0))),
                 push_count=max(0, int(payload.get("pushCount", 0))),
                 pushed_total_ms=max(0, int(payload.get("pushedTotalMillis", 0))),
@@ -432,6 +458,7 @@ class Nag:
             "workName": self.work_name,
             "nagText": self.nag_text,
             "bucket": self.bucket,
+            "projectName": self.project_name,
             "latenessDays": self.lateness_days,
             "mode": self.mode,
             "repeatMinutes": self.repeat_minutes,
@@ -452,6 +479,7 @@ class Nag:
             "recurringNthWeek": self.recurring_nth_week,
             "recurringMonthOfYear": self.recurring_month_of_year,
             "recurringQuarterAnchorMonth": self.recurring_quarter_anchor_month,
+            "recurringVisibleDaysBeforeDue": self.recurring_visible_days_before_due,
             "pushedOffsetMillis": self.pushed_offset_ms,
             "pushCount": self.push_count,
             "pushedTotalMillis": self.pushed_total_ms,
@@ -635,6 +663,22 @@ def resolve_next_due_ms(nag: Nag, reference_ms: int) -> Optional[int]:
     return apply_push_offset(nag, base_due)
 
 
+def effective_project_name(nag: Nag) -> Optional[str]:
+    if (nag.bucket or "").strip().lower() != PROJECT_BUCKET.lower():
+        return None
+    return normalize_project_name(nag.project_name) or DEFAULT_PROJECT_NAME
+
+
+def should_show_recurring_due_window(nag: Nag, due_ms: int, now_ms_value: int) -> bool:
+    if nag.mode != NAG_MODE_MONTHLY:
+        return True
+    visible_days = nag.recurring_visible_days_before_due
+    if visible_days is None:
+        return True
+    threshold_ms = now_ms_value + max(1, int(visible_days)) * 24 * 60 * 60 * 1000
+    return due_ms <= threshold_ms
+
+
 def build_visible_entries(
     nags: List[Nag],
     now_ms_value: int,
@@ -654,6 +698,8 @@ def build_visible_entries(
         if recurring_view_mode == RECUR_ALL_WINDOW:
             windows = resolve_monthly_due_windows_in_range(nag, now_ms_value, horizon_end_ms)
             for window in windows:
+                if not should_show_recurring_due_window(nag, window.due_ms, now_ms_value):
+                    continue
                 entries.append(NagListEntry(nag=nag, due_window=window, key=f"{nag.work_name}_{window.due_ms}"))
         else:
             display_window = resolve_current_display_monthly_due_window(nag, now_ms_value)
@@ -662,7 +708,46 @@ def build_visible_entries(
                 continue
             if (next_upcoming - now_ms_value) > horizon_ms:
                 continue
+            if not should_show_recurring_due_window(nag, next_upcoming, now_ms_value):
+                continue
             entries.append(NagListEntry(nag=nag, due_window=display_window, key=f"{nag.work_name}_{display_window.due_ms}"))
+    return entries
+
+
+def build_project_overview_entries(nags: List[Nag], now_ms_value: int) -> List[NagListEntry]:
+    if not nags:
+        return []
+
+    grouped: Dict[str, List[Nag]] = {}
+    for nag in nags:
+        project = effective_project_name(nag) or DEFAULT_PROJECT_NAME
+        grouped.setdefault(project, []).append(nag)
+
+    entries: List[NagListEntry] = []
+    for project_name, project_nags in grouped.items():
+        representative: Optional[Tuple[Nag, Optional[DueWindow], int]] = None
+        for nag in project_nags:
+            due_window = resolve_due_window(nag, now_ms_value)
+            due_ms = due_window.due_ms if due_window is not None else (resolve_next_due_ms(nag, now_ms_value) or 2**63 - 1)
+            candidate = (nag, due_window, due_ms)
+            if representative is None:
+                representative = candidate
+                continue
+            rep_nag, _, rep_due_ms = representative
+            rep_key = (0 if rep_due_ms <= now_ms_value else 1, rep_due_ms, -rep_nag.weight, rep_nag.created_at_epoch_ms)
+            cand_key = (0 if due_ms <= now_ms_value else 1, due_ms, -nag.weight, nag.created_at_epoch_ms)
+            if cand_key < rep_key:
+                representative = candidate
+        if representative is None:
+            continue
+        rep_nag, rep_window, _ = representative
+        entries.append(
+            NagListEntry(
+                nag=rep_nag,
+                due_window=rep_window,
+                key=f"project_overview_{project_name.lower()}",
+            )
+        )
     return entries
 
 
@@ -1099,6 +1184,7 @@ class NagDialog(tk.Toplevel):
             work_name=f"desktop-{uuid.uuid4().hex[:12]}",
             nag_text="",
             bucket=(buckets[0] if buckets else DEFAULT_BUCKETS[0]),
+            project_name=None,
             lateness_days=7,
             mode=NAG_MODE_ONE_TIME,
             repeat_minutes=60,
@@ -1115,6 +1201,7 @@ class NagDialog(tk.Toplevel):
             recurring_nth_week=1,
             recurring_month_of_year=ms_to_local(now_value).month,
             recurring_quarter_anchor_month=ms_to_local(now_value).month,
+            recurring_visible_days_before_due=None,
         )
 
         self._base = base
@@ -1125,6 +1212,7 @@ class NagDialog(tk.Toplevel):
 
         self.nag_text_var = tk.StringVar(value=base.nag_text)
         self.bucket_var = tk.StringVar(value=base.bucket)
+        self.project_name_var = tk.StringVar(value=base.project_name or "")
         self.weight_var = tk.StringVar(value=str(base.weight))
         self.lateness_var = tk.StringVar(value=str(base.lateness_days))
         self.entered_var = tk.StringVar(value=format_local_datetime(base.created_at_epoch_ms))
@@ -1139,6 +1227,9 @@ class NagDialog(tk.Toplevel):
         self.nth_week_var = tk.StringVar(value=str(base.recurring_nth_week or 1))
         self.recurring_month_var = tk.StringVar(value=str(base.recurring_month_of_year or ms_to_local(now_value).month))
         self.quarter_anchor_var = tk.StringVar(value=str(base.recurring_quarter_anchor_month or ms_to_local(now_value).month))
+        self.recurring_visible_days_var = tk.StringVar(
+            value="" if base.recurring_visible_days_before_due is None else str(base.recurring_visible_days_before_due)
+        )
 
         row = 0
         ttk.Label(container, text="Text").grid(row=row, column=0, sticky="w", **pad)
@@ -1149,6 +1240,12 @@ class NagDialog(tk.Toplevel):
         ttk.Combobox(container, textvariable=self.bucket_var, values=buckets or DEFAULT_BUCKETS, width=18).grid(row=row, column=1, sticky="w", **pad)
         ttk.Label(container, text="Icon").grid(row=row, column=2, sticky="w", **pad)
         ttk.Entry(container, textvariable=self.icon_var, width=8).grid(row=row, column=3, sticky="w", **pad)
+
+        row += 1
+        ttk.Label(container, text="Project name").grid(row=row, column=0, sticky="w", **pad)
+        ttk.Entry(container, textvariable=self.project_name_var, width=22).grid(row=row, column=1, sticky="w", **pad)
+        ttk.Label(container, text="Recur visible days").grid(row=row, column=2, sticky="w", **pad)
+        ttk.Entry(container, textvariable=self.recurring_visible_days_var, width=8).grid(row=row, column=3, sticky="w", **pad)
 
         row += 1
         ttk.Label(container, text="Weight 0-100").grid(row=row, column=0, sticky="w", **pad)
@@ -1215,6 +1312,13 @@ class NagDialog(tk.Toplevel):
             return
 
         bucket = self.bucket_var.get().strip() or DEFAULT_BUCKETS[0]
+        project_name = normalize_project_name(self.project_name_var.get())
+        if bucket.lower() == PROJECT_BUCKET.lower():
+            if not project_name:
+                messagebox.showerror("Validation", "Project name is required for Project bucket nags.", parent=self)
+                return
+        else:
+            project_name = None
         weight = self._to_int(self.weight_var.get(), "Weight")
         lateness_days = self._to_int(self.lateness_var.get(), "Lateness days")
         if weight < 0 or weight > 100:
@@ -1281,12 +1385,25 @@ class NagDialog(tk.Toplevel):
             messagebox.showerror("Validation", "Quarter anchor must be 1..12.", parent=self)
             return
 
+        recurring_visible_days: Optional[int]
+        recurring_visible_raw = self.recurring_visible_days_var.get().strip()
+        if not recurring_visible_raw:
+            recurring_visible_days = None
+        else:
+            recurring_visible_days = self._to_int(recurring_visible_raw, "Recur visible days")
+            if recurring_visible_days < 1:
+                messagebox.showerror("Validation", "Recur visible days must be at least 1.", parent=self)
+                return
+        if mode != NAG_MODE_MONTHLY:
+            recurring_visible_days = None
+
         icon = self.icon_var.get().strip() or None
 
         self.result = Nag(
             work_name=self._base.work_name,
             nag_text=nag_text,
             bucket=bucket,
+            project_name=project_name or (DEFAULT_PROJECT_NAME if bucket.lower() == PROJECT_BUCKET.lower() else None),
             lateness_days=lateness_days,
             mode=mode,
             repeat_minutes=max(1, self._base.repeat_minutes),
@@ -1305,6 +1422,7 @@ class NagDialog(tk.Toplevel):
             recurring_nth_week=recurring_nth_week,
             recurring_month_of_year=recurring_month,
             recurring_quarter_anchor_month=recurring_quarter_anchor,
+            recurring_visible_days_before_due=recurring_visible_days,
             pushed_offset_ms=max(0, self._base.pushed_offset_ms),
             push_count=max(0, self._base.push_count),
             pushed_total_ms=max(0, self._base.pushed_total_ms),
@@ -1347,6 +1465,7 @@ class NagDesktopApp:
         self._long_press_triggered = False
         self.last_parseable_payload_rows = 0
         self.last_valid_nag_rows = 0
+        self.active_project_name: Optional[str] = None
 
         self.email_var = tk.StringVar()
         self.password_var = tk.StringVar()
@@ -1361,6 +1480,7 @@ class NagDesktopApp:
         self.sort_var = tk.StringVar(value=SORT_SMART)
         self.view_days_var = tk.StringVar(value="30 days")
         self.recurring_mode_var = tk.StringVar(value=RECUR_NEXT_ONLY)
+        self.project_mode_var = tk.StringVar(value="")
 
         self._build_ui()
         self._load_saved_credentials()
@@ -1462,6 +1582,22 @@ class NagDesktopApp:
             button_store=self.recurring_buttons,
             on_select=self.refresh_visible_entries,
         )
+        self.project_nav_frame = ttk.Frame(controls)
+        self.project_nav_frame.grid(row=1, column=0, columnspan=8, padx=6, pady=(0, 4), sticky="w")
+        self.project_nav_label = ttk.Label(self.project_nav_frame, textvariable=self.project_mode_var)
+        self.project_nav_label.grid(row=0, column=0, padx=(0, 8), pady=2, sticky="w")
+        self.project_back_button = ttk.Button(
+            self.project_nav_frame,
+            text="Projects",
+            command=self._go_to_project_overview,
+        )
+        self.project_back_button.grid(row=0, column=1, padx=(0, 4), pady=2, sticky="w")
+        self.project_exit_button = ttk.Button(
+            self.project_nav_frame,
+            text="Normal view",
+            command=self._exit_project_mode,
+        )
+        self.project_exit_button.grid(row=0, column=2, padx=(0, 4), pady=2, sticky="w")
         self.write_buttons = []
 
         list_frame = ttk.Frame(main)
@@ -1486,6 +1622,8 @@ class NagDesktopApp:
         ttk.Label(main, textvariable=self.user_id_var, anchor="w").pack(fill=tk.X)
 
         self.row_menu = tk.Menu(self.root, tearoff=0)
+        self.row_menu.add_command(label="Enter project", command=self.enter_selected_project)
+        self.row_menu.add_separator()
         self.row_menu.add_command(label="Edit", command=self.edit_selected)
         self.row_menu.add_command(label="Push due...", command=self.push_selected)
         self.row_menu.add_command(label="Complete recurring occurrence", command=self.complete_selected_occurrence)
@@ -1494,6 +1632,7 @@ class NagDesktopApp:
 
         self._apply_view_only_ui_state()
         self.update_bucket_options()
+        self._update_project_navigation_ui()
 
     def _render_icon_button_group(
         self,
@@ -1550,6 +1689,8 @@ class NagDesktopApp:
             return "🌴"
         if text == "holiday":
             return "🎉"
+        if text == PROJECT_BUCKET.lower():
+            return "🗂️"
         return "🏷️"
 
     def _load_saved_credentials(self) -> None:
@@ -1699,6 +1840,8 @@ class NagDesktopApp:
         if not entry:
             return
         self.selected_key = entry.key
+        can_enter_project = self._is_project_overview_mode() and bool(effective_project_name(entry.nag))
+        self.row_menu.entryconfigure("Enter project", state="normal" if can_enter_project else "disabled")
         self._redraw_canvas()
         x_root = self.canvas.winfo_rootx() + pointer_x
         y_root = self.canvas.winfo_rooty() + pointer_y
@@ -1805,6 +1948,8 @@ class NagDesktopApp:
         self.nags_by_work = {}
         self.visible_entries = []
         self.selected_key = None
+        self.active_project_name = None
+        self.bucket_var.set(ALL_BUCKET)
         self.last_parseable_payload_rows = 0
         self.last_valid_nag_rows = 0
         self.update_bucket_options()
@@ -1895,15 +2040,13 @@ class NagDesktopApp:
 
     def update_bucket_options(self) -> None:
         buckets = sorted({nag.bucket for nag in self.nags_by_work.values()}, key=lambda s: s.lower())
-        merged = [ALL_BUCKET] + [b for b in DEFAULT_BUCKETS if b in buckets] + [b for b in buckets if b not in DEFAULT_BUCKETS]
+        merged = [ALL_BUCKET] + DEFAULT_BUCKETS + [b for b in buckets if b not in DEFAULT_BUCKETS]
         seen: set[str] = set()
         final: List[str] = []
         for bucket in merged:
             if bucket not in seen:
                 seen.add(bucket)
                 final.append(bucket)
-        if not final:
-            final = [ALL_BUCKET] + DEFAULT_BUCKETS
         self.bucket_options = final
         if self.bucket_var.get() not in final:
             self.bucket_var.set(ALL_BUCKET)
@@ -1913,26 +2056,93 @@ class NagDesktopApp:
             selected_value=self.bucket_var,
             icon_for=self._bucket_icon,
             button_store=self.bucket_buttons,
-            on_select=self.refresh_visible_entries,
+            on_select=self._on_bucket_selected,
         )
+        self._update_project_navigation_ui()
+
+    def _on_bucket_selected(self) -> None:
+        selected_bucket = (self.bucket_var.get() or ALL_BUCKET).strip()
+        if selected_bucket.lower() != PROJECT_BUCKET.lower():
+            self.active_project_name = None
+        self.refresh_visible_entries()
 
     def refresh_visible_entries(self) -> None:
         now_value = now_ms()
         selected_bucket = self.bucket_var.get() or ALL_BUCKET
         monthly_days = MONTHLY_VIEW_1_YEAR_DAYS if self.view_days_var.get() == "1 year" else MONTHLY_VIEW_30_DAYS
 
+        if selected_bucket.lower() != PROJECT_BUCKET.lower():
+            self.active_project_name = None
         nags = list(self.nags_by_work.values())
+        project_overview_mode = False
         if selected_bucket != ALL_BUCKET:
-            nags = [n for n in nags if n.bucket == selected_bucket]
+            if selected_bucket.lower() == PROJECT_BUCKET.lower():
+                nags = [n for n in nags if (n.bucket or "").strip().lower() == PROJECT_BUCKET.lower()]
+                active_project = normalize_project_name(self.active_project_name)
+                if active_project:
+                    nags = [
+                        n for n in nags
+                        if (effective_project_name(n) or DEFAULT_PROJECT_NAME).lower() == active_project.lower()
+                    ]
+                else:
+                    project_overview_mode = True
+            else:
+                nags = [n for n in nags if n.bucket == selected_bucket]
 
-        entries = build_visible_entries(
-            nags=nags,
-            now_ms_value=now_value,
-            monthly_view_days=monthly_days,
-            recurring_view_mode=self.recurring_mode_var.get() or RECUR_NEXT_ONLY,
-        )
+        if project_overview_mode:
+            entries = build_project_overview_entries(nags=nags, now_ms_value=now_value)
+        else:
+            entries = build_visible_entries(
+                nags=nags,
+                now_ms_value=now_value,
+                monthly_view_days=monthly_days,
+                recurring_view_mode=self.recurring_mode_var.get() or RECUR_NEXT_ONLY,
+            )
         self.visible_entries = sort_entries(entries, self.sort_var.get() or SORT_SMART, now_value)
+        self._update_project_navigation_ui()
         self._redraw_canvas()
+
+    def _is_project_overview_mode(self) -> bool:
+        selected_bucket = (self.bucket_var.get() or ALL_BUCKET).strip().lower()
+        return selected_bucket == PROJECT_BUCKET.lower() and normalize_project_name(self.active_project_name) is None
+
+    def _update_project_navigation_ui(self) -> None:
+        selected_bucket = (self.bucket_var.get() or ALL_BUCKET).strip().lower()
+        if selected_bucket != PROJECT_BUCKET.lower():
+            self.project_mode_var.set("")
+            self.project_nav_frame.grid_remove()
+            return
+
+        self.project_nav_frame.grid()
+        active_project = normalize_project_name(self.active_project_name)
+        if active_project:
+            self.project_mode_var.set(f"Project: {active_project}")
+            self.project_back_button.grid()
+        else:
+            self.project_mode_var.set("Project list: tap a row to enter")
+            self.project_back_button.grid_remove()
+        self.project_exit_button.grid()
+
+    def _go_to_project_overview(self) -> None:
+        self.active_project_name = None
+        self.refresh_visible_entries()
+
+    def _exit_project_mode(self) -> None:
+        self.active_project_name = None
+        self.bucket_var.set(ALL_BUCKET)
+        self.refresh_visible_entries()
+
+    def _try_enter_project_from_entry(self, entry: Optional[NagListEntry]) -> bool:
+        if not entry or not self._is_project_overview_mode():
+            return False
+        project_name = effective_project_name(entry.nag)
+        if not project_name:
+            return False
+        if not messagebox.askyesno("Enter project", f"Open project \"{project_name}\"?", parent=self.root):
+            return False
+        self.active_project_name = project_name
+        self.refresh_visible_entries()
+        return True
 
     def _find_entry_by_y(self, y: int) -> Optional[NagListEntry]:
         canvas_y = int(self.canvas.canvasy(y))
@@ -1943,11 +2153,15 @@ class NagDesktopApp:
 
     def on_canvas_click(self, event: tk.Event) -> None:
         entry = self._find_entry_by_y(event.y)
+        if self._try_enter_project_from_entry(entry):
+            return
         self.selected_key = entry.key if entry else None
         self._redraw_canvas()
 
     def on_canvas_double_click(self, event: tk.Event) -> None:
         entry = self._find_entry_by_y(event.y)
+        if self._try_enter_project_from_entry(entry):
+            return
         if entry:
             self.selected_key = entry.key
             self.edit_selected()
@@ -1956,6 +2170,8 @@ class NagDesktopApp:
         entry = self._find_entry_by_y(event.y)
         if entry:
             self.selected_key = entry.key
+            can_enter_project = self._is_project_overview_mode() and bool(effective_project_name(entry.nag))
+            self.row_menu.entryconfigure("Enter project", state="normal" if can_enter_project else "disabled")
             self._redraw_canvas()
             try:
                 self.row_menu.tk_popup(event.x_root, event.y_root)
@@ -1969,6 +2185,18 @@ class NagDesktopApp:
             if entry.key == self.selected_key:
                 return entry
         return None
+
+    def enter_selected_project(self) -> None:
+        entry = self._selected_entry()
+        if entry is None:
+            messagebox.showinfo("Select", "Select a project row first.", parent=self.root)
+            return
+        if not self._try_enter_project_from_entry(entry):
+            messagebox.showinfo(
+                "Project view",
+                "This option is available in Project bucket overview rows.",
+                parent=self.root,
+            )
 
     def _insert_event(self, action: str, nag: Nag) -> bool:
         if self._reject_write_when_view_only():
@@ -2153,16 +2381,20 @@ class NagDesktopApp:
         x0 = 8
         x1 = width - 12
         selected_bucket = self.bucket_var.get() or ALL_BUCKET
+        project_overview_mode = self._is_project_overview_mode()
 
         self.row_bounds = []
         now_value = now_ms()
 
         if not self.visible_entries:
+            empty_message = "No nags to show."
+            if selected_bucket.lower() == PROJECT_BUCKET.lower() and project_overview_mode:
+                empty_message = "No projects in Project bucket yet."
             self.canvas.create_text(
                 20,
                 24,
                 anchor="w",
-                text="No nags to show.",
+                text=empty_message,
                 fill="#444444",
                 font=("TkDefaultFont", 11),
             )
@@ -2209,10 +2441,20 @@ class NagDesktopApp:
             icon = (normalize_icon_glyph(nag.icon_glyph) or "")[:3]
             if image is not None:
                 icon = ""
-            title = f"{icon + ' ' if icon else ''}{nag.nag_text}"
+            project_name = effective_project_name(nag)
+            if project_overview_mode:
+                title_prefix = f"[{project_name or DEFAULT_PROJECT_NAME}] "
+            elif selected_bucket == ALL_BUCKET:
+                if project_name:
+                    title_prefix = f"[{nag.bucket}:{project_name}] "
+                else:
+                    title_prefix = f"[{nag.bucket}] "
+            else:
+                title_prefix = ""
+            title = f"{icon + ' ' if icon else ''}{title_prefix}{nag.nag_text}"
             subtitle_parts: List[str] = [f"w{nag.weight}", f"late:{nag.lateness_days}d"]
-            if selected_bucket == ALL_BUCKET:
-                subtitle_parts.insert(0, f"[{nag.bucket}]")
+            if nag.mode == NAG_MODE_MONTHLY and nag.recurring_visible_days_before_due is not None:
+                subtitle_parts.append(f"vis<= {max(1, nag.recurring_visible_days_before_due)}d")
             recurring_badge = recurring_indicator_label(nag)
             if recurring_badge:
                 subtitle_parts.append(recurring_badge)
