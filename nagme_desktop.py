@@ -696,6 +696,8 @@ class SupabaseSession:
         self.access_token: Optional[str] = None
         self.user_id: Optional[str] = None
         self.table_name: Optional[str] = None
+        self.table_row_counts: Dict[str, int] = {}
+        self.table_fetch_errors: Dict[str, str] = {}
 
     @property
     def signed_in(self) -> bool:
@@ -705,6 +707,8 @@ class SupabaseSession:
         self.access_token = None
         self.user_id = None
         self.table_name = None
+        self.table_row_counts = {}
+        self.table_fetch_errors = {}
 
     def sign_in(self, email: str, password: str) -> str:
         endpoint = f"{self.supabase_url}/auth/v1/token?grant_type=password"
@@ -790,36 +794,86 @@ class SupabaseSession:
     def fetch_events(self) -> List[Dict[str, Any]]:
         if not self.user_id:
             raise RuntimeError("Not signed in.")
-        table = self.detect_table()
+        self.detect_table()
+        self.table_row_counts = {}
+        self.table_fetch_errors = {}
         headers = self._auth_headers(include_json=False)
-        events: List[Dict[str, Any]] = []
-        step = 1000
-        offset = 0
+        merged_events: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        table_order = [self.table_name] + [t for t in TABLE_CANDIDATES if t != self.table_name]
 
-        while True:
-            params = {
-                "select": "id,created_at,payload,user_id",
-                "order": "created_at.asc",
-                "limit": str(step),
-                "offset": str(offset),
-            }
-            response = requests.get(
-                f"{self.supabase_url}/rest/v1/{table}",
-                headers=headers,
-                params=params,
-                timeout=30,
+        for table in table_order:
+            if not table:
+                continue
+            events: List[Dict[str, Any]] = []
+            step = 1000
+            offset = 0
+            try:
+                while True:
+                    params = {
+                        "select": "id,created_at,payload,user_id",
+                        "order": "created_at.asc",
+                        "limit": str(step),
+                        "offset": str(offset),
+                    }
+                    response = requests.get(
+                        f"{self.supabase_url}/rest/v1/{table}",
+                        headers=headers,
+                        params=params,
+                        timeout=30,
+                    )
+                    if response.status_code >= 300:
+                        raise RuntimeError(self._extract_error(response))
+                    batch = response.json()
+                    if not isinstance(batch, list):
+                        raise RuntimeError("Unexpected response format while loading rows.")
+                    events.extend(batch)
+                    if len(batch) < step:
+                        break
+                    offset += step
+                self.table_row_counts[table] = len(events)
+                for event in events:
+                    if isinstance(event, dict):
+                        event["_source_table"] = table
+                    merged_events.append(event)
+            except Exception as exc:
+                error_text = str(exc)
+                normalized = error_text.lower()
+                is_missing_fallback_table = (
+                    table == "events"
+                    and "http 404" in normalized
+                    and ("could not find the table" in normalized or "public.events" in normalized)
+                )
+                if is_missing_fallback_table:
+                    # Optional fallback table is absent in this project; skip quietly.
+                    continue
+                self.table_fetch_errors[table] = error_text
+                errors.append(f"{table}: {error_text}")
+                continue
+
+        if not self.table_row_counts:
+            detail = "; ".join(errors) if errors else "No accessible tables found."
+            raise RuntimeError(f"Unable to load from nag/events. {detail}")
+
+        self.table_name = max(self.table_row_counts.items(), key=lambda item: item[1])[0]
+
+        dedup: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        for event in merged_events:
+            payload_value = event.get("payload")
+            if isinstance(payload_value, (dict, list)):
+                payload_key = json.dumps(payload_value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            else:
+                payload_key = str(payload_value)
+            dedup_key = (
+                str(event.get("created_at", "")),
+                str(event.get("user_id", "")),
+                payload_key,
             )
-            if response.status_code >= 300:
-                raise RuntimeError(self._extract_error(response))
-            batch = response.json()
-            if not isinstance(batch, list):
-                raise RuntimeError("Unexpected response format while loading rows.")
-            events.extend(batch)
-            if len(batch) < step:
-                break
-            offset += step
+            dedup[dedup_key] = event
 
-        return events
+        rows = list(dedup.values())
+        rows.sort(key=lambda row: str(row.get("created_at", "")))
+        return rows
 
     def insert_event(self, payload: Dict[str, Any]) -> None:
         if not self.user_id:
@@ -1095,9 +1149,12 @@ class NagDesktopApp:
         self.row_bounds: List[Tuple[int, int, NagListEntry]] = []
         self.selected_key: Optional[str] = None
         self.write_buttons: List[ttk.Button] = []
+        self.last_parseable_payload_rows = 0
+        self.last_valid_nag_rows = 0
 
         self.email_var = tk.StringVar()
         self.password_var = tk.StringVar()
+        self.user_id_var = tk.StringVar(value="User ID: (not signed in)")
         self.status_var = tk.StringVar(
             value="View-only mode. Sign in to load nags from Supabase."
             if VIEW_ONLY_MODE
@@ -1139,10 +1196,29 @@ class NagDesktopApp:
         ttk.Label(login, text="Password").grid(row=0, column=2, padx=6, pady=4, sticky="w")
         ttk.Entry(login, textvariable=self.password_var, width=24, show="*").grid(row=0, column=3, padx=6, pady=4, sticky="w")
 
-        ttk.Button(login, text="Sign in", command=self.sign_in).grid(row=0, column=4, padx=6, pady=4)
-        ttk.Button(login, text="Sign out", command=self.sign_out).grid(row=0, column=5, padx=6, pady=4)
-        ttk.Button(login, text="Reload", command=self.reload_from_supabase).grid(row=0, column=6, padx=6, pady=4)
-        ttk.Button(login, text="Sync all", command=self.sync_all).grid(row=0, column=7, padx=6, pady=4)
+        self.sign_in_button = ttk.Button(login, text="Sign in", command=self.sign_in)
+        self.sign_in_button.grid(row=0, column=4, padx=6, pady=4)
+        self.sign_out_button = ttk.Button(login, text="Sign out", command=self.sign_out)
+        self.sign_out_button.grid(row=0, column=5, padx=6, pady=4)
+        self.reload_button = ttk.Button(login, text="Reload", command=self.reload_from_supabase)
+        self.reload_button.grid(row=0, column=6, padx=6, pady=4)
+        self.sync_all_button = ttk.Button(login, text="Sync all", command=self.sync_all)
+        self.sync_all_button.grid(row=0, column=7, padx=6, pady=4)
+
+        login_bg = self.root.cget("bg")
+        self.auth_indicator_canvas = tk.Canvas(
+            login,
+            width=16,
+            height=16,
+            bg=login_bg,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.auth_indicator_canvas.grid(row=0, column=8, padx=(10, 4), pady=4, sticky="w")
+        self.auth_indicator_circle = self.auth_indicator_canvas.create_oval(
+            2, 2, 14, 14, fill="#d32f2f", outline="#6d0000"
+        )
+        ttk.Label(login, text="Supabase").grid(row=0, column=9, padx=(0, 6), pady=4, sticky="w")
 
         controls = ttk.LabelFrame(main, text="View")
         controls.pack(fill=tk.X, pady=(0, 8))
@@ -1173,9 +1249,18 @@ class NagDesktopApp:
         recurring_combo.grid(row=0, column=7, padx=6, pady=4, sticky="w")
         recurring_combo.bind("<<ComboboxSelected>>", lambda _: self.refresh_visible_entries())
 
-        ttk.Button(controls, text="Add nag", command=self.add_nag).grid(row=0, column=8, padx=8, pady=4)
-        ttk.Button(controls, text="Edit selected", command=self.edit_selected).grid(row=0, column=9, padx=8, pady=4)
-        ttk.Button(controls, text="Delete selected", command=self.delete_selected).grid(row=0, column=10, padx=8, pady=4)
+        self.add_button = ttk.Button(controls, text="Add nag", command=self.add_nag)
+        self.add_button.grid(row=0, column=8, padx=8, pady=4)
+        self.edit_button = ttk.Button(controls, text="Edit selected", command=self.edit_selected)
+        self.edit_button.grid(row=0, column=9, padx=8, pady=4)
+        self.delete_button = ttk.Button(controls, text="Delete selected", command=self.delete_selected)
+        self.delete_button.grid(row=0, column=10, padx=8, pady=4)
+        self.write_buttons = [
+            self.sync_all_button,
+            self.add_button,
+            self.edit_button,
+            self.delete_button,
+        ]
 
         list_frame = ttk.Frame(main)
         list_frame.pack(fill=tk.BOTH, expand=True)
@@ -1198,6 +1283,7 @@ class NagDesktopApp:
 
         status = ttk.Label(main, textvariable=self.status_var, anchor="w")
         status.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(main, textvariable=self.user_id_var, anchor="w").pack(fill=tk.X)
 
         self.row_menu = tk.Menu(self.root, tearoff=0)
         self.row_menu.add_command(label="Edit", command=self.edit_selected)
@@ -1206,6 +1292,7 @@ class NagDesktopApp:
         self.row_menu.add_separator()
         self.row_menu.add_command(label="Delete", command=self.delete_selected)
 
+        self._apply_view_only_ui_state()
         self.update_bucket_options()
 
     def on_mousewheel(self, event: tk.Event) -> None:
@@ -1214,6 +1301,34 @@ class NagDesktopApp:
             self.canvas.yview_scroll(-1, "units")
         elif delta < 0:
             self.canvas.yview_scroll(1, "units")
+
+    def _apply_view_only_ui_state(self) -> None:
+        if not VIEW_ONLY_MODE:
+            return
+        for button in self.write_buttons:
+            button.state(["disabled"])
+        self.row_menu.entryconfigure("Edit", state="disabled")
+        self.row_menu.entryconfigure("Push due...", state="disabled")
+        self.row_menu.entryconfigure("Complete recurring occurrence", state="disabled")
+        self.row_menu.entryconfigure("Delete", state="disabled")
+
+    def _reject_write_when_view_only(self) -> bool:
+        if not VIEW_ONLY_MODE:
+            return False
+        self.set_status("View-only mode is enabled. Write/sync actions are disabled.")
+        return True
+
+    def _update_auth_indicator(self) -> None:
+        if not hasattr(self, "auth_indicator_canvas"):
+            return
+        signed_in = self.session.signed_in
+        fill = "#2e7d32" if signed_in else "#c62828"
+        outline = "#1b5e20" if signed_in else "#8e0000"
+        self.auth_indicator_canvas.itemconfigure(
+            self.auth_indicator_circle,
+            fill=fill,
+            outline=outline,
+        )
 
     def set_status(self, message: str) -> None:
         self.status_var.set(message)
@@ -1226,9 +1341,13 @@ class NagDesktopApp:
             return
         try:
             user_id = self.session.sign_in(email, password)
+            self._update_auth_indicator()
+            self.user_id_var.set(f"User ID: {user_id}")
             self.set_status(f"Signed in as {user_id}. Loading nags...")
             self.reload_from_supabase()
         except Exception as exc:
+            self._update_auth_indicator()
+            self.user_id_var.set("User ID: (sign-in failed)")
             self.set_status(f"Sign-in failed: {exc}")
             messagebox.showerror("Supabase sign-in failed", str(exc), parent=self.root)
 
@@ -1238,12 +1357,20 @@ class NagDesktopApp:
         self.nags_by_work = {}
         self.visible_entries = []
         self.selected_key = None
+        self.last_parseable_payload_rows = 0
+        self.last_valid_nag_rows = 0
         self.update_bucket_options()
         self._redraw_canvas()
+        self._update_auth_indicator()
+        self.user_id_var.set("User ID: (not signed in)")
         self.set_status("Signed out.")
 
     def _parse_payload(self, value: Any) -> Optional[Dict[str, Any]]:
         if isinstance(value, dict):
+            if "payload" in value and isinstance(value.get("payload"), (dict, str)):
+                nested = self._parse_payload(value.get("payload"))
+                if nested:
+                    return nested
             return value
         if isinstance(value, str):
             text = value.strip()
@@ -1258,19 +1385,25 @@ class NagDesktopApp:
 
     def _rebuild_current_nags_from_events(self) -> None:
         current: Dict[str, Nag] = {}
+        parseable_count = 0
+        valid_nag_count = 0
         sorted_events = sorted(self.events, key=lambda e: str(e.get("created_at", "")))
         for row in sorted_events:
             payload = self._parse_payload(row.get("payload"))
             if not payload:
                 continue
+            parseable_count += 1
             nag = Nag.from_payload(payload)
             if not nag:
                 continue
+            valid_nag_count += 1
             action = str(payload.get("action", "")).strip().lower()
             if action == "delete":
                 current.pop(nag.work_name, None)
             else:
                 current[nag.work_name] = nag
+        self.last_parseable_payload_rows = parseable_count
+        self.last_valid_nag_rows = valid_nag_count
         self.nags_by_work = current
 
     def reload_from_supabase(self) -> None:
@@ -1283,8 +1416,25 @@ class NagDesktopApp:
             self.selected_key = None
             self.update_bucket_options()
             self.refresh_visible_entries()
+            table_counts = ", ".join(
+                f"{table}:{count}"
+                for table, count in self.session.table_row_counts.items()
+            )
+            if not table_counts:
+                table_counts = "no rows"
+            table_errors = ", ".join(
+                f"{table}:{err}"
+                for table, err in self.session.table_fetch_errors.items()
+            )
+            errors_suffix = f"; errors {table_errors}" if table_errors else ""
+            no_rows_suffix = ""
+            if len(self.events) == 0:
+                no_rows_suffix = " No readable rows were returned for this signed-in user."
             self.set_status(
-                f"Loaded {len(self.events)} row(s), active nags: {len(self.nags_by_work)} (table: {self.session.table_name})."
+                f"Loaded {len(self.events)} merged row(s), active nags: {len(self.nags_by_work)} "
+                f"(payload rows {self.last_parseable_payload_rows}, valid nag rows {self.last_valid_nag_rows}; "
+                f"tables {table_counts}; active table: {self.session.table_name}; "
+                f"user {self.session.user_id}{errors_suffix}).{no_rows_suffix}"
             )
         except Exception as exc:
             self.set_status(f"Load failed: {exc}")
@@ -1360,6 +1510,8 @@ class NagDesktopApp:
         return None
 
     def _insert_event(self, action: str, nag: Nag) -> bool:
+        if self._reject_write_when_view_only():
+            return False
         if not self.session.signed_in:
             messagebox.showwarning("Sign in required", "Sign in first.", parent=self.root)
             return False
@@ -1373,6 +1525,8 @@ class NagDesktopApp:
             return False
 
     def sync_all(self) -> None:
+        if self._reject_write_when_view_only():
+            return
         if not self.session.signed_in:
             messagebox.showwarning("Sign in required", "Sign in first.", parent=self.root)
             return
@@ -1383,6 +1537,8 @@ class NagDesktopApp:
         self.set_status(f"Synced {count} nag(s).")
 
     def add_nag(self) -> None:
+        if self._reject_write_when_view_only():
+            return
         buckets = [b for b in self.bucket_combo.cget("values") if b != ALL_BUCKET]
         dialog = NagDialog(self.root, None, buckets)
         self.root.wait_window(dialog)
@@ -1395,6 +1551,8 @@ class NagDesktopApp:
             self.refresh_visible_entries()
 
     def edit_selected(self) -> None:
+        if self._reject_write_when_view_only():
+            return
         entry = self._selected_entry()
         if not entry:
             messagebox.showinfo("Select", "Select a nag first.", parent=self.root)
@@ -1417,6 +1575,8 @@ class NagDesktopApp:
             self.refresh_visible_entries()
 
     def delete_selected(self) -> None:
+        if self._reject_write_when_view_only():
+            return
         entry = self._selected_entry()
         if not entry:
             messagebox.showinfo("Select", "Select a nag first.", parent=self.root)
@@ -1436,6 +1596,8 @@ class NagDesktopApp:
             self.refresh_visible_entries()
 
     def push_selected(self) -> None:
+        if self._reject_write_when_view_only():
+            return
         entry = self._selected_entry()
         if not entry:
             messagebox.showinfo("Select", "Select a nag first.", parent=self.root)
@@ -1467,6 +1629,8 @@ class NagDesktopApp:
             self.refresh_visible_entries()
 
     def complete_selected_occurrence(self) -> None:
+        if self._reject_write_when_view_only():
+            return
         entry = self._selected_entry()
         if not entry:
             messagebox.showinfo("Select", "Select a recurring nag row first.", parent=self.root)
