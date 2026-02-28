@@ -744,7 +744,7 @@ def build_project_overview_entries(nags: List[Nag], now_ms_value: int) -> List[N
         entries.append(
             NagListEntry(
                 nag=rep_nag,
-                due_window=rep_window,
+                due_window=None,
                 key=f"project_overview_{project_name.lower()}",
             )
         )
@@ -2075,7 +2075,9 @@ class NagDesktopApp:
             self.active_project_name = None
         nags = list(self.nags_by_work.values())
         project_overview_mode = False
-        if selected_bucket != ALL_BUCKET:
+        if selected_bucket == ALL_BUCKET:
+            nags = [n for n in nags if (n.bucket or "").strip().lower() != PROJECT_BUCKET.lower()]
+        else:
             if selected_bucket.lower() == PROJECT_BUCKET.lower():
                 nags = [n for n in nags if (n.bucket or "").strip().lower() == PROJECT_BUCKET.lower()]
                 active_project = normalize_project_name(self.active_project_name)
@@ -2382,6 +2384,13 @@ class NagDesktopApp:
         x1 = width - 12
         selected_bucket = self.bucket_var.get() or ALL_BUCKET
         project_overview_mode = self._is_project_overview_mode()
+        project_counts: Dict[str, int] = {}
+        if project_overview_mode:
+            for candidate in self.nags_by_work.values():
+                project_name = effective_project_name(candidate)
+                if not project_name:
+                    continue
+                project_counts[project_name] = project_counts.get(project_name, 0) + 1
 
         self.row_bounds = []
         now_value = now_ms()
@@ -2407,7 +2416,17 @@ class NagDesktopApp:
             y0 = 6 + index * row_height
             y1 = y0 + row_height - 8
             nag = entry.nag
-            visual = nag_line_visual(nag, now_value, entry.due_window)
+            if project_overview_mode:
+                visual = NagLineVisual(
+                    base_color=(255, 255, 255),
+                    progress_color=(230, 230, 230),
+                    progress_fraction=0.0,
+                    text_color="#000000",
+                    time_label="",
+                    percent_label="",
+                )
+            else:
+                visual = nag_line_visual(nag, now_value, entry.due_window)
 
             self.canvas.create_rectangle(
                 x0,
@@ -2452,16 +2471,20 @@ class NagDesktopApp:
             else:
                 title_prefix = ""
             title = f"{icon + ' ' if icon else ''}{title_prefix}{nag.nag_text}"
-            subtitle_parts: List[str] = [f"w{nag.weight}", f"late:{nag.lateness_days}d"]
-            if nag.mode == NAG_MODE_MONTHLY and nag.recurring_visible_days_before_due is not None:
-                subtitle_parts.append(f"vis<= {max(1, nag.recurring_visible_days_before_due)}d")
-            recurring_badge = recurring_indicator_label(nag)
-            if recurring_badge:
-                subtitle_parts.append(recurring_badge)
-            push_badge = push_summary_label(nag)
-            if push_badge:
-                subtitle_parts.append(push_badge)
-            subtitle = "  ".join(subtitle_parts)
+            if project_overview_mode:
+                project_task_count = project_counts.get(project_name or DEFAULT_PROJECT_NAME, 0)
+                subtitle = f"{project_task_count} task(s) in project"
+            else:
+                subtitle_parts: List[str] = [f"w{nag.weight}", f"late:{nag.lateness_days}d"]
+                if nag.mode == NAG_MODE_MONTHLY and nag.recurring_visible_days_before_due is not None:
+                    subtitle_parts.append(f"vis<= {max(1, nag.recurring_visible_days_before_due)}d")
+                recurring_badge = recurring_indicator_label(nag)
+                if recurring_badge:
+                    subtitle_parts.append(recurring_badge)
+                push_badge = push_summary_label(nag)
+                if push_badge:
+                    subtitle_parts.append(push_badge)
+                subtitle = "  ".join(subtitle_parts)
 
             self.canvas.create_text(
                 left_text_x,
@@ -2483,17 +2506,18 @@ class NagDesktopApp:
                 font=("TkDefaultFont", 8),
             )
 
-            right_label = visual.time_label
-            if visual.percent_label:
-                right_label = f"{right_label} /{visual.percent_label}".strip()
-            self.canvas.create_text(
-                x1 - 8,
-                y0 + (row_height / 2) - 6,
-                anchor="e",
-                text=right_label,
-                fill=visual.text_color,
-                font=("TkDefaultFont", 9),
-            )
+            if not project_overview_mode:
+                right_label = visual.time_label
+                if visual.percent_label:
+                    right_label = f"{right_label} /{visual.percent_label}".strip()
+                self.canvas.create_text(
+                    x1 - 8,
+                    y0 + (row_height / 2) - 6,
+                    anchor="e",
+                    text=right_label,
+                    fill=visual.text_color,
+                    font=("TkDefaultFont", 9),
+                )
 
             self.row_bounds.append((y0, y1, entry))
 
