@@ -1261,8 +1261,12 @@ class NagDesktopApp:
         self.row_image_cache: Dict[str, ImageTk.PhotoImage] = {}
         self.row_image_failures: set[str] = set()
         self._touch_scroll_press_y = 0
+        self._touch_scroll_press_x = 0
         self._touch_scroll_dragging = False
         self._touch_scroll_last_y = 0
+        self._touch_scroll_threshold_px = 18
+        self._long_press_job: Optional[str] = None
+        self._long_press_triggered = False
         self.last_parseable_payload_rows = 0
         self.last_valid_nag_rows = 0
 
@@ -1395,9 +1399,9 @@ class NagDesktopApp:
         self.canvas.bind("<Double-1>", self.on_canvas_double_click)
         self.canvas.bind("<Button-3>", self.on_canvas_right_click)
 
-        self.canvas.bind_all("<MouseWheel>", self.on_mousewheel)
-        self.canvas.bind_all("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))
-        self.canvas.bind_all("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))
+        self.canvas.bind("<MouseWheel>", self.on_mousewheel)
+        self.canvas.bind("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))
+        self.canvas.bind("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))
 
         status = ttk.Label(main, textvariable=self.status_var, anchor="w")
         status.pack(fill=tk.X, pady=(8, 0))
@@ -1526,16 +1530,30 @@ class NagDesktopApp:
             self.canvas.yview_scroll(1, "units")
 
     def on_canvas_press(self, event: tk.Event) -> None:
+        self._cancel_long_press()
+        self._touch_scroll_press_x = event.x
         self._touch_scroll_press_y = event.y
         self._touch_scroll_last_y = event.y
         self._touch_scroll_dragging = False
+        self._long_press_triggered = False
+        self._long_press_job = self.root.after(550, lambda: self._trigger_long_press(event.x, event.y))
 
     def on_canvas_drag(self, event: tk.Event) -> None:
-        if abs(event.y - self._touch_scroll_press_y) >= 8:
+        if (
+            abs(event.y - self._touch_scroll_press_y) >= self._touch_scroll_threshold_px
+            or abs(event.x - self._touch_scroll_press_x) >= self._touch_scroll_threshold_px
+        ):
             self._touch_scroll_dragging = True
+        if self._touch_scroll_dragging:
+            self._cancel_long_press()
+
         if self._touch_scroll_dragging:
             step_px = 3
             delta_y = event.y - self._touch_scroll_last_y
+            # First frame after crossing threshold should not jump.
+            if self._touch_scroll_last_y == self._touch_scroll_press_y:
+                self._touch_scroll_last_y = event.y
+                return
             units = int(round(delta_y / step_px))
             if units != 0:
                 # Positive drag (finger moves down) should scroll content up.
@@ -1543,9 +1561,35 @@ class NagDesktopApp:
                 self._touch_scroll_last_y = event.y
 
     def on_canvas_release(self, event: tk.Event) -> None:
+        self._cancel_long_press()
+        if self._long_press_triggered:
+            self._long_press_triggered = False
+            return
         if self._touch_scroll_dragging:
             return
         self.on_canvas_click(event)
+
+    def _cancel_long_press(self) -> None:
+        if self._long_press_job:
+            self.root.after_cancel(self._long_press_job)
+            self._long_press_job = None
+
+    def _trigger_long_press(self, x: int, y: int) -> None:
+        self._long_press_job = None
+        if self._touch_scroll_dragging:
+            return
+        self._long_press_triggered = True
+        entry = self._find_entry_by_y(y)
+        if not entry:
+            return
+        self.selected_key = entry.key
+        self._redraw_canvas()
+        x_root = self.canvas.winfo_rootx() + x
+        y_root = self.canvas.winfo_rooty() + y
+        try:
+            self.row_menu.tk_popup(x_root, y_root)
+        finally:
+            self.row_menu.grab_release()
 
     def _apply_view_only_ui_state(self) -> None:
         if not VIEW_ONLY_MODE:
