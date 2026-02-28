@@ -1401,8 +1401,8 @@ class NagDesktopApp:
         self.canvas.bind("<Button-3>", self.on_canvas_right_click)
 
         self.canvas.bind("<MouseWheel>", self.on_mousewheel)
-        self.canvas.bind("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))
-        self.canvas.bind("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))
+        self.canvas.bind("<Button-4>", self.on_mousewheel_up_linux)
+        self.canvas.bind("<Button-5>", self.on_mousewheel_down_linux)
 
         status = ttk.Label(main, textvariable=self.status_var, anchor="w")
         status.pack(fill=tk.X, pady=(8, 0))
@@ -1523,14 +1523,23 @@ class NagDesktopApp:
         finally:
             self._schedule_auto_reload()
 
-    def on_mousewheel(self, event: tk.Event) -> None:
+    def on_mousewheel(self, event: tk.Event) -> str:
         delta = event.delta
         if delta > 0:
             self.canvas.yview_scroll(-1, "units")
         elif delta < 0:
             self.canvas.yview_scroll(1, "units")
+        return "break"
 
-    def on_canvas_press(self, event: tk.Event) -> None:
+    def on_mousewheel_up_linux(self, event: tk.Event) -> str:
+        self.canvas.yview_scroll(-1, "units")
+        return "break"
+
+    def on_mousewheel_down_linux(self, event: tk.Event) -> str:
+        self.canvas.yview_scroll(1, "units")
+        return "break"
+
+    def on_canvas_press(self, event: tk.Event) -> str:
         self._cancel_long_press()
         self._touch_scroll_press_x = event.x
         self._touch_scroll_press_y = event.y
@@ -1540,11 +1549,23 @@ class NagDesktopApp:
         self._touch_scroll_dragging = False
         self._long_press_triggered = False
         self._long_press_job = self.root.after(550, lambda: self._trigger_long_press(event.x, event.y))
+        return "break"
 
-    def on_canvas_drag(self, event: tk.Event) -> None:
+    def on_canvas_drag(self, event: tk.Event) -> str:
+        if self._long_press_triggered:
+            return "break"
+
         # Touch scrolling should start only from vertical movement.
-        if abs(event.y - self._touch_scroll_press_y) >= self._touch_scroll_threshold_px:
-            self._touch_scroll_dragging = True
+        if not self._touch_scroll_dragging:
+            if abs(event.y - self._touch_scroll_press_y) >= self._touch_scroll_threshold_px:
+                # Arm drag anchor on threshold crossing; avoid first-frame jump.
+                self._touch_scroll_dragging = True
+                self._touch_scroll_press_y = event.y
+                current_view = self.canvas.yview()
+                self._touch_scroll_start_fraction = current_view[0] if current_view else 0.0
+            else:
+                return "break"
+
         if self._touch_scroll_dragging:
             self._cancel_long_press()
 
@@ -1567,15 +1588,18 @@ class NagDesktopApp:
             total_drag_dy = float(event.y - self._touch_scroll_press_y)
             target_offset = max(0.0, min(max_offset, start_offset - total_drag_dy))
             self.canvas.yview_moveto(target_offset / max_offset)
+        return "break"
 
-    def on_canvas_release(self, event: tk.Event) -> None:
+    def on_canvas_release(self, event: tk.Event) -> str:
         self._cancel_long_press()
         if self._long_press_triggered:
             self._long_press_triggered = False
-            return
+            return "break"
         if self._touch_scroll_dragging:
-            return
+            self._touch_scroll_dragging = False
+            return "break"
         self.on_canvas_click(event)
+        return "break"
 
     def _cancel_long_press(self) -> None:
         if self._long_press_job:
@@ -1586,14 +1610,21 @@ class NagDesktopApp:
         self._long_press_job = None
         if self._touch_scroll_dragging:
             return
+        pointer_x = self.canvas.winfo_pointerx() - self.canvas.winfo_rootx()
+        pointer_y = self.canvas.winfo_pointery() - self.canvas.winfo_rooty()
+        if (
+            abs(pointer_x - self._touch_scroll_press_x) > self._touch_scroll_threshold_px
+            or abs(pointer_y - self._touch_scroll_press_y) > self._touch_scroll_threshold_px
+        ):
+            return
         self._long_press_triggered = True
-        entry = self._find_entry_by_y(y)
+        entry = self._find_entry_by_y(pointer_y)
         if not entry:
             return
         self.selected_key = entry.key
         self._redraw_canvas()
-        x_root = self.canvas.winfo_rootx() + x
-        y_root = self.canvas.winfo_rooty() + y
+        x_root = self.canvas.winfo_rootx() + pointer_x
+        y_root = self.canvas.winfo_rooty() + pointer_y
         try:
             self.row_menu.tk_popup(x_root, y_root)
         finally:
