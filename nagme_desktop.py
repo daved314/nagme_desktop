@@ -1265,6 +1265,7 @@ class NagDesktopApp:
         self._touch_scroll_dragging = False
         self._touch_scroll_last_y = 0
         self._touch_scroll_threshold_px = 18
+        self._touch_scroll_start_fraction = 0.0
         self._long_press_job: Optional[str] = None
         self._long_press_triggered = False
         self.last_parseable_payload_rows = 0
@@ -1534,6 +1535,8 @@ class NagDesktopApp:
         self._touch_scroll_press_x = event.x
         self._touch_scroll_press_y = event.y
         self._touch_scroll_last_y = event.y
+        current_view = self.canvas.yview()
+        self._touch_scroll_start_fraction = current_view[0] if current_view else 0.0
         self._touch_scroll_dragging = False
         self._long_press_triggered = False
         self._long_press_job = self.root.after(550, lambda: self._trigger_long_press(event.x, event.y))
@@ -1548,17 +1551,24 @@ class NagDesktopApp:
             self._cancel_long_press()
 
         if self._touch_scroll_dragging:
-            step_px = 3
-            delta_y = event.y - self._touch_scroll_last_y
-            # First frame after crossing threshold should not jump.
-            if self._touch_scroll_last_y == self._touch_scroll_press_y:
-                self._touch_scroll_last_y = event.y
+            scroll_region = self.canvas.cget("scrollregion")
+            if not scroll_region:
                 return
-            units = int(round(delta_y / step_px))
-            if units != 0:
-                # Positive drag (finger moves down) should scroll content up.
-                self.canvas.yview_scroll(-units, "units")
-                self._touch_scroll_last_y = event.y
+            try:
+                x0, y0, x1, y1 = [float(v) for v in str(scroll_region).split()]
+            except Exception:
+                return
+
+            content_height = max(0.0, y1 - y0)
+            viewport_height = float(max(1, self.canvas.winfo_height()))
+            max_offset = max(0.0, content_height - viewport_height)
+            if max_offset <= 0:
+                return
+
+            start_offset = self._touch_scroll_start_fraction * max_offset
+            total_drag_dy = float(event.y - self._touch_scroll_press_y)
+            target_offset = max(0.0, min(max_offset, start_offset - total_drag_dy))
+            self.canvas.yview_moveto(target_offset / max_offset)
 
     def on_canvas_release(self, event: tk.Event) -> None:
         self._cancel_long_press()
