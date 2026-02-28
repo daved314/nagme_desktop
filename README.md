@@ -31,6 +31,13 @@ pip install -r requirements.txt
 python nagme_desktop.py
 ```
 
+Or use the bootstrap launchers:
+
+- Linux/macOS: `bash run.sh`
+- Windows PowerShell: `.\run.ps1`
+
+These scripts create/use `.venv`, install requirements when missing, then start the app.
+
 ## Notes
 
 - Works on Windows and Linux (Tkinter UI).

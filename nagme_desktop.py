@@ -1262,6 +1262,7 @@ class NagDesktopApp:
         self.row_image_failures: set[str] = set()
         self._touch_scroll_press_y = 0
         self._touch_scroll_dragging = False
+        self._touch_scroll_last_y = 0
         self.last_parseable_payload_rows = 0
         self.last_valid_nag_rows = 0
 
@@ -1526,14 +1527,20 @@ class NagDesktopApp:
 
     def on_canvas_press(self, event: tk.Event) -> None:
         self._touch_scroll_press_y = event.y
+        self._touch_scroll_last_y = event.y
         self._touch_scroll_dragging = False
-        self.canvas.scan_mark(event.x, event.y)
 
     def on_canvas_drag(self, event: tk.Event) -> None:
         if abs(event.y - self._touch_scroll_press_y) >= 8:
             self._touch_scroll_dragging = True
         if self._touch_scroll_dragging:
-            self.canvas.scan_dragto(event.x, event.y, gain=1)
+            step_px = 3
+            delta_y = event.y - self._touch_scroll_last_y
+            units = int(round(delta_y / step_px))
+            if units != 0:
+                # Positive drag (finger moves down) should scroll content up.
+                self.canvas.yview_scroll(-units, "units")
+                self._touch_scroll_last_y = event.y
 
     def on_canvas_release(self, event: tk.Event) -> None:
         if self._touch_scroll_dragging:
