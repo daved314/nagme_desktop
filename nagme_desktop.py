@@ -34,6 +34,7 @@ TABLE_CANDIDATES = ("nag", "events")
 VIEW_ONLY_MODE = True
 AUTO_RELOAD_INTERVAL_MS = 60 * 60 * 1000
 CREDENTIALS_FILE = os.path.join(os.path.expanduser("~"), ".nagme_desktop_credentials.json")
+UI_OPTIONS_FILE = os.path.join(os.path.expanduser("~"), ".nagme_desktop_ui_options.json")
 CORE_EVENT_SELECT_COLUMNS = "id,created_at,payload,user_id"
 EXTENDED_EVENT_SELECT_COLUMNS = "id,created_at,payload,user_id,icon_png_base64,payload_version,client_synced_at,event_id"
 
@@ -101,6 +102,41 @@ RECURRING_ICON_MAP = {
     RECUR_NEXT_ONLY: "➡️",
     RECUR_ALL_WINDOW: "🔁",
 }
+SORT_TEXT_MAP = {
+    SORT_ENTERED: "Entered",
+    SORT_WEIGHT: "Weight",
+    SORT_DUE: "Due",
+    SORT_SMART: "Smart",
+}
+VIEW_WINDOW_TEXT_MAP = {
+    "30 days": "30d",
+    "1 year": "1y",
+}
+RECURRING_TEXT_MAP = {
+    RECUR_NEXT_ONLY: "Next",
+    RECUR_ALL_WINDOW: "All",
+}
+
+
+def is_raspberry_pi_device() -> bool:
+    if platform.system().lower() != "linux":
+        return False
+    model_paths = (
+        "/proc/device-tree/model",
+        "/sys/firmware/devicetree/base/model",
+    )
+    for model_path in model_paths:
+        try:
+            with open(model_path, "r", encoding="utf-8", errors="ignore") as handle:
+                model_text = handle.read().strip().lower()
+            if "raspberry pi" in model_text:
+                return True
+        except Exception:
+            continue
+
+    node_text = platform.node().lower()
+    machine_text = platform.machine().lower()
+    return "raspberrypi" in node_text and ("arm" in machine_text or "aarch" in machine_text)
 
 
 def now_ms() -> int:
@@ -724,7 +760,8 @@ def build_project_overview_entries(nags: List[Nag], now_ms_value: int) -> List[N
         grouped.setdefault(project, []).append(nag)
 
     entries: List[NagListEntry] = []
-    for project_name, project_nags in grouped.items():
+    for project_name in sorted(grouped.keys(), key=lambda value: value.lower()):
+        project_nags = grouped[project_name]
         representative: Optional[Tuple[Nag, Optional[DueWindow], int]] = None
         for nag in project_nags:
             due_window = resolve_due_window(nag, now_ms_value)
@@ -1437,6 +1474,7 @@ class NagDesktopApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Nagme Desktop")
+        self.is_raspberry_pi = is_raspberry_pi_device()
 
         self._configure_platform_ui()
 
@@ -1463,6 +1501,7 @@ class NagDesktopApp:
         self._touch_scroll_start_fraction = 0.0
         self._long_press_job: Optional[str] = None
         self._long_press_triggered = False
+        self.display_scroll_job: Optional[str] = None
         self.last_parseable_payload_rows = 0
         self.last_valid_nag_rows = 0
         self.active_project_name: Optional[str] = None
@@ -1481,9 +1520,14 @@ class NagDesktopApp:
         self.view_days_var = tk.StringVar(value="30 days")
         self.recurring_mode_var = tk.StringVar(value=RECUR_NEXT_ONLY)
         self.project_mode_var = tk.StringVar(value="")
+        self.scroll_display_var = tk.BooleanVar(value=self.is_raspberry_pi)
+        self.show_project_tasks_in_work_var = tk.BooleanVar(value=self.is_raspberry_pi)
+        self.always_work_bucket_var = tk.BooleanVar(value=self.is_raspberry_pi)
+        self._load_ui_options()
 
         self._build_ui()
         self._load_saved_credentials()
+        self._on_view_options_changed()
         self._update_auth_indicator()
         self._redraw_canvas()
         self._schedule_auto_reload()
@@ -1499,11 +1543,34 @@ class NagDesktopApp:
                 style.theme_use("vista")
         else:
             self.root.geometry("1280x840")
-            self.root.option_add("*Font", "{DejaVu Sans} 10")
+            if self.is_raspberry_pi:
+                self.root.option_add("*Font", "{DejaVu Sans} 10")
+            else:
+                self.root.option_add("*Font", "{DejaVu Sans} 10")
             if "clam" in style.theme_names():
                 style.theme_use("clam")
 
     def _build_ui(self) -> None:
+        menu_bar = tk.Menu(self.root)
+        options_menu = tk.Menu(menu_bar, tearoff=0)
+        options_menu.add_checkbutton(
+            label="Scroll the display",
+            variable=self.scroll_display_var,
+            command=self._on_view_options_changed,
+        )
+        options_menu.add_checkbutton(
+            label="Show the top project tasks in work bucket",
+            variable=self.show_project_tasks_in_work_var,
+            command=self._on_view_options_changed,
+        )
+        options_menu.add_checkbutton(
+            label="Always display work bucket",
+            variable=self.always_work_bucket_var,
+            command=self._on_view_options_changed,
+        )
+        menu_bar.add_cascade(label="Options", menu=options_menu)
+        self.root.configure(menu=menu_bar)
+
         main = ttk.Frame(self.root, padding=8)
         main.pack(fill=tk.BOTH, expand=True)
 
@@ -1554,7 +1621,7 @@ class NagDesktopApp:
             container=sort_selector_frame,
             options=SORT_OPTIONS,
             selected_value=self.sort_var,
-            icon_for=lambda value: SORT_ICON_MAP.get(value, "•"),
+            icon_for=lambda value: self._display_filter_label(value, SORT_ICON_MAP, SORT_TEXT_MAP),
             button_store=self.sort_buttons,
             on_select=self.refresh_visible_entries,
         )
@@ -1566,7 +1633,7 @@ class NagDesktopApp:
             container=window_selector_frame,
             options=["30 days", "1 year"],
             selected_value=self.view_days_var,
-            icon_for=lambda value: VIEW_WINDOW_ICON_MAP.get(value, "•"),
+            icon_for=lambda value: self._display_filter_label(value, VIEW_WINDOW_ICON_MAP, VIEW_WINDOW_TEXT_MAP),
             button_store=self.window_buttons,
             on_select=self.refresh_visible_entries,
         )
@@ -1578,7 +1645,7 @@ class NagDesktopApp:
             container=recurring_selector_frame,
             options=[RECUR_NEXT_ONLY, RECUR_ALL_WINDOW],
             selected_value=self.recurring_mode_var,
-            icon_for=lambda value: RECURRING_ICON_MAP.get(value, "•"),
+            icon_for=lambda value: self._display_filter_label(value, RECURRING_ICON_MAP, RECURRING_TEXT_MAP),
             button_store=self.recurring_buttons,
             on_select=self.refresh_visible_entries,
         )
@@ -1647,11 +1714,18 @@ class NagDesktopApp:
             child.destroy()
         button_store.clear()
         for col, option in enumerate(options):
+            button_text = icon_for(option)
+            if self.is_raspberry_pi:
+                button_font = ("TkDefaultFont", 9)
+                button_width = max(4, min(10, len(button_text) + 1))
+            else:
+                button_font = ("Segoe UI Emoji", 16)
+                button_width = 3
             button = tk.Button(
                 container,
-                text=icon_for(option),
-                font=("Segoe UI Emoji", 16),
-                width=3,
+                text=button_text,
+                font=button_font,
+                width=button_width,
                 height=1,
                 padx=2,
                 pady=2,
@@ -1676,9 +1750,42 @@ class NagDesktopApp:
             else:
                 button.configure(relief=tk.RAISED, bg="#f1f1f1")
 
-    @staticmethod
-    def _bucket_icon(bucket_name: str) -> str:
+    def _display_filter_label(
+        self,
+        value: str,
+        emoji_map: Dict[str, str],
+        text_map: Dict[str, str],
+    ) -> str:
+        if self.is_raspberry_pi:
+            return text_map.get(value, value[:8] or "Opt")
+        return emoji_map.get(value, "•")
+
+    def _raspberry_pi_icon_text(self, icon_text: str) -> str:
+        if not self.is_raspberry_pi:
+            return icon_text
+        if all(ord(ch) < 128 for ch in icon_text):
+            return icon_text[:4]
+        codepoints = [f"{ord(ch):X}" for ch in icon_text if not ch.isspace()]
+        if not codepoints:
+            return ""
+        return f"[{'-'.join(codepoints[:2])}]"
+
+    def _bucket_icon(self, bucket_name: str) -> str:
         text = bucket_name.strip().lower()
+        if self.is_raspberry_pi:
+            if text == ALL_BUCKET.lower():
+                return "All"
+            if text == "work":
+                return "Work"
+            if text == "personal":
+                return "Pers"
+            if text == "weekend":
+                return "Wknd"
+            if text == "holiday":
+                return "Holi"
+            if text == PROJECT_BUCKET.lower():
+                return "Proj"
+            return bucket_name[:6] if bucket_name else "Tag"
         if text == ALL_BUCKET.lower():
             return "🧺"
         if text == "work":
@@ -1692,6 +1799,38 @@ class NagDesktopApp:
         if text == PROJECT_BUCKET.lower():
             return "🗂️"
         return "🏷️"
+
+    def _resolve_work_bucket_name(self) -> str:
+        for bucket in self.bucket_options:
+            if bucket.strip().lower() == "work":
+                return bucket
+        return "Work"
+
+    def _load_ui_options(self) -> None:
+        try:
+            if not os.path.exists(UI_OPTIONS_FILE):
+                return
+            with open(UI_OPTIONS_FILE, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            self.scroll_display_var.set(bool(data.get("scroll_display", self.scroll_display_var.get())))
+            self.show_project_tasks_in_work_var.set(
+                bool(data.get("show_project_tasks_in_work", self.show_project_tasks_in_work_var.get()))
+            )
+            self.always_work_bucket_var.set(bool(data.get("always_display_work_bucket", self.always_work_bucket_var.get())))
+        except Exception:
+            return
+
+    def _save_ui_options(self) -> None:
+        payload = {
+            "scroll_display": bool(self.scroll_display_var.get()),
+            "show_project_tasks_in_work": bool(self.show_project_tasks_in_work_var.get()),
+            "always_display_work_bucket": bool(self.always_work_bucket_var.get()),
+        }
+        try:
+            with open(UI_OPTIONS_FILE, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+        except Exception:
+            return
 
     def _load_saved_credentials(self) -> None:
         try:
@@ -1747,17 +1886,26 @@ class NagDesktopApp:
             self.canvas.yview_scroll(-1, "units")
         elif delta < 0:
             self.canvas.yview_scroll(1, "units")
+        self._schedule_display_scroll()
         return "break"
 
     def on_mousewheel_up_linux(self, event: tk.Event) -> str:
         self.canvas.yview_scroll(-1, "units")
+        self._schedule_display_scroll()
         return "break"
 
     def on_mousewheel_down_linux(self, event: tk.Event) -> str:
         self.canvas.yview_scroll(1, "units")
+        self._schedule_display_scroll()
         return "break"
 
     def on_canvas_press(self, event: tk.Event) -> str:
+        if self.display_scroll_job is not None:
+            try:
+                self.root.after_cancel(self.display_scroll_job)
+            except Exception:
+                pass
+            self.display_scroll_job = None
         self._cancel_long_press()
         self._touch_scroll_press_x = event.x
         self._touch_scroll_press_y = event.y
@@ -1812,11 +1960,14 @@ class NagDesktopApp:
         self._cancel_long_press()
         if self._long_press_triggered:
             self._long_press_triggered = False
+            self._schedule_display_scroll()
             return "break"
         if self._touch_scroll_dragging:
             self._touch_scroll_dragging = False
+            self._schedule_display_scroll()
             return "break"
         self.on_canvas_click(event)
+        self._schedule_display_scroll()
         return "break"
 
     def _cancel_long_press(self) -> None:
@@ -1840,7 +1991,7 @@ class NagDesktopApp:
         if not entry:
             return
         self.selected_key = entry.key
-        can_enter_project = self._is_project_overview_mode() and bool(effective_project_name(entry.nag))
+        can_enter_project = (self.bucket_var.get() or "").strip().lower() == PROJECT_BUCKET.lower() and self._is_project_summary_entry(entry)
         self.row_menu.entryconfigure("Enter project", state="normal" if can_enter_project else "disabled")
         self._redraw_canvas()
         x_root = self.canvas.winfo_rootx() + pointer_x
@@ -1944,6 +2095,12 @@ class NagDesktopApp:
     def sign_out(self) -> None:
         self.session.sign_out()
         self._clear_saved_credentials()
+        if self.display_scroll_job is not None:
+            try:
+                self.root.after_cancel(self.display_scroll_job)
+            except Exception:
+                pass
+            self.display_scroll_job = None
         self.events = []
         self.nags_by_work = {}
         self.visible_entries = []
@@ -1953,7 +2110,7 @@ class NagDesktopApp:
         self.last_parseable_payload_rows = 0
         self.last_valid_nag_rows = 0
         self.update_bucket_options()
-        self._redraw_canvas()
+        self.refresh_visible_entries()
         self._update_auth_indicator()
         self.user_id_var.set("User ID: (not signed in)")
         self.set_status("Signed out.")
@@ -2050,6 +2207,8 @@ class NagDesktopApp:
         self.bucket_options = final
         if self.bucket_var.get() not in final:
             self.bucket_var.set(ALL_BUCKET)
+        if self.always_work_bucket_var.get():
+            self.bucket_var.set(self._resolve_work_bucket_name())
         self._render_icon_button_group(
             container=self.bucket_selector_frame,
             options=final,
@@ -2060,7 +2219,22 @@ class NagDesktopApp:
         )
         self._update_project_navigation_ui()
 
+    def _on_view_options_changed(self) -> None:
+        self._save_ui_options()
+        if self.always_work_bucket_var.get():
+            self.active_project_name = None
+            self.bucket_var.set(self._resolve_work_bucket_name())
+            self._update_icon_button_state(self.bucket_buttons, self.bucket_var.get())
+        self.refresh_visible_entries()
+
     def _on_bucket_selected(self) -> None:
+        if self.always_work_bucket_var.get():
+            selected_bucket = self._resolve_work_bucket_name()
+            self.bucket_var.set(selected_bucket)
+            self.active_project_name = None
+            self._update_icon_button_state(self.bucket_buttons, selected_bucket)
+            self.refresh_visible_entries()
+            return
         selected_bucket = (self.bucket_var.get() or ALL_BUCKET).strip()
         if selected_bucket.lower() != PROJECT_BUCKET.lower():
             self.active_project_name = None
@@ -2068,6 +2242,11 @@ class NagDesktopApp:
 
     def refresh_visible_entries(self) -> None:
         now_value = now_ms()
+        if self.always_work_bucket_var.get():
+            work_bucket = self._resolve_work_bucket_name()
+            if (self.bucket_var.get() or "").strip().lower() != work_bucket.lower():
+                self.bucket_var.set(work_bucket)
+                self._update_icon_button_state(self.bucket_buttons, work_bucket)
         selected_bucket = self.bucket_var.get() or ALL_BUCKET
         monthly_days = MONTHLY_VIEW_1_YEAR_DAYS if self.view_days_var.get() == "1 year" else MONTHLY_VIEW_30_DAYS
 
@@ -2093,20 +2272,76 @@ class NagDesktopApp:
 
         if project_overview_mode:
             entries = build_project_overview_entries(nags=nags, now_ms_value=now_value)
+            self.visible_entries = sort_entries(entries, self.sort_var.get() or SORT_SMART, now_value)
         else:
-            entries = build_visible_entries(
+            work_entries = build_visible_entries(
                 nags=nags,
                 now_ms_value=now_value,
                 monthly_view_days=monthly_days,
                 recurring_view_mode=self.recurring_mode_var.get() or RECUR_NEXT_ONLY,
             )
-        self.visible_entries = sort_entries(entries, self.sort_var.get() or SORT_SMART, now_value)
+            if self.show_project_tasks_in_work_var.get() and selected_bucket.strip().lower() == self._resolve_work_bucket_name().lower():
+                project_nags = [
+                    n for n in self.nags_by_work.values()
+                    if (n.bucket or "").strip().lower() == PROJECT_BUCKET.lower()
+                ]
+                project_entries = sort_entries(
+                    build_project_overview_entries(nags=project_nags, now_ms_value=now_value),
+                    self.sort_var.get() or SORT_SMART,
+                    now_value,
+                )
+                self.visible_entries = project_entries + sort_entries(
+                    work_entries,
+                    self.sort_var.get() or SORT_SMART,
+                    now_value,
+                )
+            else:
+                self.visible_entries = sort_entries(work_entries, self.sort_var.get() or SORT_SMART, now_value)
         self._update_project_navigation_ui()
         self._redraw_canvas()
+        self._schedule_display_scroll()
 
     def _is_project_overview_mode(self) -> bool:
         selected_bucket = (self.bucket_var.get() or ALL_BUCKET).strip().lower()
         return selected_bucket == PROJECT_BUCKET.lower() and normalize_project_name(self.active_project_name) is None
+
+    @staticmethod
+    def _is_project_summary_entry(entry: Optional[NagListEntry]) -> bool:
+        return entry is not None and entry.key.startswith("project_overview_") and bool(effective_project_name(entry.nag))
+
+    def _schedule_display_scroll(self) -> None:
+        if self.display_scroll_job is not None:
+            try:
+                self.root.after_cancel(self.display_scroll_job)
+            except Exception:
+                pass
+            self.display_scroll_job = None
+        if not self.scroll_display_var.get():
+            return
+        if (self.bucket_var.get() or "").strip().lower() != self._resolve_work_bucket_name().lower():
+            return
+        self.display_scroll_job = self.root.after(1200, self._display_scroll_tick)
+
+    def _display_scroll_tick(self) -> None:
+        self.display_scroll_job = None
+        if not self.scroll_display_var.get():
+            return
+        if (self.bucket_var.get() or "").strip().lower() != self._resolve_work_bucket_name().lower():
+            return
+        view = self.canvas.yview()
+        if not view:
+            self.display_scroll_job = self.root.after(200, self._display_scroll_tick)
+            return
+        start, end = view
+        visible_fraction = max(0.001, end - start)
+        if end >= 0.999:
+            self.canvas.yview_moveto(0.0)
+            delay = 1500
+        else:
+            new_start = min(max(0.0, 1.0 - visible_fraction), start + 0.0018)
+            self.canvas.yview_moveto(new_start)
+            delay = 120
+        self.display_scroll_job = self.root.after(delay, self._display_scroll_tick)
 
     def _update_project_navigation_ui(self) -> None:
         selected_bucket = (self.bucket_var.get() or ALL_BUCKET).strip().lower()
@@ -2131,12 +2366,18 @@ class NagDesktopApp:
 
     def _exit_project_mode(self) -> None:
         self.active_project_name = None
-        self.bucket_var.set(ALL_BUCKET)
+        if self.always_work_bucket_var.get():
+            self.bucket_var.set(self._resolve_work_bucket_name())
+        else:
+            self.bucket_var.set(ALL_BUCKET)
         self.refresh_visible_entries()
 
     def _try_enter_project_from_entry(self, entry: Optional[NagListEntry]) -> bool:
-        if not entry or not self._is_project_overview_mode():
+        if not self._is_project_summary_entry(entry):
             return False
+        if (self.bucket_var.get() or "").strip().lower() != PROJECT_BUCKET.lower():
+            return False
+        assert entry is not None
         project_name = effective_project_name(entry.nag)
         if not project_name:
             return False
@@ -2170,7 +2411,7 @@ class NagDesktopApp:
         entry = self._find_entry_by_y(event.y)
         if entry:
             self.selected_key = entry.key
-            can_enter_project = self._is_project_overview_mode() and bool(effective_project_name(entry.nag))
+            can_enter_project = (self.bucket_var.get() or "").strip().lower() == PROJECT_BUCKET.lower() and self._is_project_summary_entry(entry)
             self.row_menu.entryconfigure("Enter project", state="normal" if can_enter_project else "disabled")
             self._redraw_canvas()
             try:
@@ -2194,7 +2435,7 @@ class NagDesktopApp:
         if not self._try_enter_project_from_entry(entry):
             messagebox.showinfo(
                 "Project view",
-                "This option is available in Project bucket overview rows.",
+                "This option is available for project summary rows.",
                 parent=self.root,
             )
 
@@ -2383,12 +2624,11 @@ class NagDesktopApp:
         selected_bucket = self.bucket_var.get() or ALL_BUCKET
         project_overview_mode = self._is_project_overview_mode()
         project_counts: Dict[str, int] = {}
-        if project_overview_mode:
-            for candidate in self.nags_by_work.values():
-                project_name = effective_project_name(candidate)
-                if not project_name:
-                    continue
-                project_counts[project_name] = project_counts.get(project_name, 0) + 1
+        for candidate in self.nags_by_work.values():
+            project_name = effective_project_name(candidate)
+            if not project_name:
+                continue
+            project_counts[project_name] = project_counts.get(project_name, 0) + 1
 
         self.row_bounds = []
         now_value = now_ms()
@@ -2414,7 +2654,8 @@ class NagDesktopApp:
             y0 = 6 + index * row_height
             y1 = y0 + row_height - 8
             nag = entry.nag
-            if project_overview_mode:
+            is_project_summary = self._is_project_summary_entry(entry)
+            if is_project_summary:
                 visual = NagLineVisual(
                     base_color=(255, 255, 255),
                     progress_color=(230, 230, 230),
@@ -2456,10 +2697,12 @@ class NagDesktopApp:
                 self.canvas.create_image(x0 + 10, y0 + int((row_height - 8) / 2), image=image, anchor="w")
                 left_text_x = x0 + 54
             icon = (normalize_icon_glyph(nag.icon_glyph) or "")[:3]
+            if self.is_raspberry_pi and icon:
+                icon = self._raspberry_pi_icon_text(icon)
             if image is not None:
                 icon = ""
             project_name = effective_project_name(nag)
-            if project_overview_mode:
+            if is_project_summary:
                 title_prefix = f"[{project_name or DEFAULT_PROJECT_NAME}] "
             elif selected_bucket == ALL_BUCKET:
                 if project_name:
@@ -2469,7 +2712,7 @@ class NagDesktopApp:
             else:
                 title_prefix = ""
             title = f"{icon + ' ' if icon else ''}{title_prefix}{nag.nag_text}"
-            if project_overview_mode:
+            if is_project_summary:
                 project_task_count = project_counts.get(project_name or DEFAULT_PROJECT_NAME, 0)
                 subtitle = f"{project_task_count} task(s) in project"
             else:
@@ -2504,7 +2747,7 @@ class NagDesktopApp:
                 font=("TkDefaultFont", 8),
             )
 
-            if not project_overview_mode:
+            if not is_project_summary:
                 right_label = visual.time_label
                 if visual.percent_label:
                     right_label = f"{right_label} /{visual.percent_label}".strip()
